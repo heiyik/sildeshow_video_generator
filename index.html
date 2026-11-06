@@ -43,8 +43,32 @@
         .upload-zone:hover { border-color: var(--primary); background: #f0fdf4; }
         input[type="file"] { display: none; }
         
+        .settings-zone {
+            margin: 20px 0 10px 0;
+            padding: 15px;
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 12px;
+        }
+        .settings-zone label {
+            font-weight: 600;
+            color: #4b5563;
+        }
+        .settings-zone input {
+            width: 70px;
+            padding: 8px;
+            font-size: 16px;
+            border: 1px solid #cbd5e1;
+            border-radius: 6px;
+            text-align: center;
+        }
+
         .controls {
-            margin: 20px 0;
+            margin: 15px 0;
             display: flex;
             gap: 15px;
             justify-content: center;
@@ -96,6 +120,7 @@
 <div class="container">
     <h1>📸 純前端相片資料夾轉影片 App</h1>
     
+    <!-- 資料夾上載區域 -->
     <div class="upload-zone" onclick="document.getElementById('folderInput').click()">
         <p>📂 點擊這裡選擇包含相片的【資料夾】</p>
         <p style="font-size: 12px; color: #64748b;">(相片只會在本地處理，絕不上載伺服器)</p>
@@ -103,11 +128,20 @@
         <div class="file-count" id="fileCount"></div>
     </div>
 
+    <!-- 參數設定區域 -->
+    <div class="settings-zone">
+        <label for="durationInput">⏱️ 每張相片顯示秒數：</label>
+        <input type="number" id="durationInput" value="5" min="1" max="10" step="0.5">
+        <span style="color: #64748b; font-size: 14px;">秒 (包含淡入淡出各 0.5 秒)</span>
+    </div>
+
+    <!-- 控制按鈕 -->
     <div class="controls">
         <button id="btnPreview" disabled>▶️ 預覽 Slideshow</button>
         <button id="btnRender" disabled>🎬 生成並下載影片</button>
     </div>
 
+    <!-- 預覽畫布與狀態 -->
     <div class="preview-box">
         <canvas id="videoCanvas" width="1280" height="720"></canvas>
         <div class="status" id="statusText">請先選擇一個包含相片的資料夾。</div>
@@ -116,6 +150,7 @@
 
 <script>
     const folderInput = document.getElementById('folderInput');
+    const durationInput = document.getElementById('durationInput');
     const btnPreview = document.getElementById('btnPreview');
     const btnRender = document.getElementById('btnRender');
     const canvas = document.getElementById('videoCanvas');
@@ -123,16 +158,25 @@
     const statusText = document.getElementById('statusText');
     const fileCountText = document.getElementById('fileCount');
 
-    let imageElements = [];
+    let imageElements = []; // 存放預載入的 Image 物件
     let isPlaying = false;
     let animationFrameId = null;
 
-    const DISPLAY_DURATION = 3000; 
+    // 固定淡入淡出時長為 0.5 秒 (500 毫秒)
     const FADE_DURATION = 500;     
-    const FPS = 30;
+    const FPS = 30; // 錄製幀率
 
+    // 獲取目前用戶設定的單張播放總時長 (毫秒)
+    function getDisplayDuration() {
+        let val = parseFloat(durationInput.value);
+        if (isNaN(val) || val < 1) val = 5; // 防錯機制，預設 3 秒
+        return val * 1000;
+    }
+
+    // 1. 監聽資料夾選取
     folderInput.addEventListener('change', async (e) => {
         const files = Array.from(e.target.files);
+        // 過濾出圖片檔案，並按檔名排序
         const imgFiles = files.filter(file => file.type.startsWith('image/')).sort((a, b) => a.name.localeCompare(b.name));
         
         if (imgFiles.length === 0) {
@@ -145,6 +189,7 @@
         btnPreview.disabled = true;
         btnRender.disabled = true;
 
+        // 預載入所有相片
         imageElements = [];
         for (let file of imgFiles) {
             try {
@@ -160,9 +205,11 @@
         btnPreview.disabled = false;
         btnRender.disabled = false;
         
+        // 預先繪製第一張相片
         if (imageElements.length > 0) drawImageCover(imageElements[0], 1);
     });
 
+    // 將 File 轉為 Image 物件的 Promise
     function loadImage(file) {
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
@@ -177,6 +224,7 @@
         });
     }
 
+    // 2. 核心繪圖邏輯：自動適應比例裁剪 (Object-Fit: Cover) 加上不透明度控制
     function drawImageCover(img, alpha) {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.save();
@@ -199,20 +247,25 @@
         }
 
         ctx.fillStyle = '#000000';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillRect(0, 0, canvas.width, canvas.height); // 鋪黑底
         ctx.drawImage(img, drawX, drawY, drawWidth, drawHeight);
         ctx.restore();
     }
 
-    function getAlphaForTime(timeInImg) {
+    // 計算特定時間點下，相片的透明度 (實現 Fade In / Fade Out)
+    function getAlphaForTime(timeInImg, displayDuration) {
         if (timeInImg < FADE_DURATION) {
+            // 淡入階段 (0 -> 1)
             return timeInImg / FADE_DURATION;
-        } else if (timeInImg > DISPLAY_DURATION - FADE_DURATION) {
-            return (DISPLAY_DURATION - timeInImg) / FADE_DURATION;
+        } else if (timeInImg > displayDuration - FADE_DURATION) {
+            // 淡出階段 (1 -> 0)
+            return (displayDuration - timeInImg) / FADE_DURATION;
         }
+        // 正常顯示
         return 1.0;
     }
 
+    // 3. 預覽功能 (純播放，不錄影)
     btnPreview.addEventListener('click', () => {
         if (isPlaying) {
             stopPreview();
@@ -222,9 +275,11 @@
         isPlaying = true;
         btnPreview.innerText = "⏹️ 停止預覽";
         btnRender.disabled = true;
+        durationInput.disabled = true; // 播放時不允許更改設定
         
         let startTime = performance.now();
-        const totalDuration = imageElements.length * DISPLAY_DURATION;
+        const displayDuration = getDisplayDuration();
+        const totalDuration = imageElements.length * displayDuration;
 
         function tick(now) {
             if (!isPlaying) return;
@@ -235,9 +290,9 @@
                 return;
             }
 
-            let imgIndex = Math.floor(elapsed / DISPLAY_DURATION);
-            let timeInImg = elapsed % DISPLAY_DURATION;
-            let alpha = getAlphaForTime(timeInImg);
+            let imgIndex = Math.floor(elapsed / displayDuration);
+            let timeInImg = elapsed % displayDuration;
+            let alpha = getAlphaForTime(timeInImg, displayDuration);
 
             drawImageCover(imageElements[imgIndex], alpha);
             statusText.innerText = `正在預覽：第 ${imgIndex + 1} / ${imageElements.length} 張相片`;
@@ -252,77 +307,3 @@
         if (animationFrameId) cancelAnimationFrame(animationFrameId);
         btnPreview.innerText = "▶️ 預覽 Slideshow";
         btnRender.disabled = false;
-        statusText.innerText = "預覽已停止。";
-        if (imageElements.length > 0) drawImageCover(imageElements[0], 1);
-    }
-
-    btnRender.addEventListener('click', () => {
-        btnPreview.disabled = true;
-        btnRender.disabled = true;
-        statusText.innerText = "🎬 正在生成影片，請勿關閉網頁...";
-
-        const stream = canvas.captureStream(FPS);
-        
-        let options = { mimeType: 'video/webm;codecs=vp9' };
-        if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-            options = { mimeType: 'video/webm;codecs=vp8' };
-        }
-        if (MediaRecorder.isTypeSupported('video/mp4')) {
-            options = { mimeType: 'video/mp4' };
-        }
-
-        const recorder = new MediaRecorder(stream, options);
-        const chunks = [];
-
-        recorder.ondataavailable = (e) => {
-            if (e.data && e.data.size > 0) chunks.push(e.data);
-        };
-
-        recorder.onstop = () => {
-            const blob = new Blob(chunks, { type: recorder.mimeType });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `slideshow_${Date.now()}.${options.mimeType.includes('mp4') ? 'mp4' : 'webm'}`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            
-            btnPreview.disabled = false;
-            btnRender.disabled = false;
-            statusText.innerText = "🎉 影片生成完畢，已自動開始下載！";
-        };
-
-        recorder.start();
-
-        let currentFrame = 0;
-        const totalFrames = (imageElements.length * DISPLAY_DURATION / 1000) * FPS;
-
-        function renderNextFrame() {
-            if (currentFrame >= totalFrames) {
-                setTimeout(() => {
-                    recorder.stop();
-                }, 500);
-                return;
-            }
-
-            let currentTimeMs = (currentFrame / FPS) * 1000;
-            let imgIndex = Math.floor(currentTimeMs / DISPLAY_DURATION);
-            let timeInImg = currentTimeMs % DISPLAY_DURATION;
-            let alpha = getAlphaForTime(timeInImg);
-
-            drawImageCover(imageElements[imgIndex], alpha);
-            
-            let percent = Math.floor((currentFrame / totalFrames) * 1000) / 10;
-            statusText.innerText = `🎬 影片錄製中：${percent}% (正在渲染第 ${imgIndex + 1} 張相片)`;
-
-            currentFrame++;
-            setTimeout(renderNextFrame, 1000 / FPS);
-        }
-
-        renderNextFrame();
-    });
-</script>
-
-</body>
-</html>
