@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>純前端 Slideshow 影片生成器</title>
+    <style>
+        :root {
+            --primary: #4f46e5;
+            --primary-hover: #4338ca;
+            --bg: #f3f4f6;
+            --card-bg: #ffffff;
+            --text: #1f2937;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .container {
+            max-width: 800px;
+            width: 100%;
+            background: var(--card-bg);
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+        h1 { text-align: center; margin-top: 0; color: #111827; }
+        .upload-zone {
+            border: 2px dashed #cbd5e1;
+            padding: 30px;
+            text-align: center;
+            border-radius: 8px;
+            background: #f8fafc;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .upload-zone:hover { border-color: var(--primary); background: #f0fdf4; }
+        input[type="file"] { display: none; }
+        
+        .controls {
+            margin: 20px 0;
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        button {
+            background-color: var(--primary);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 16px;
+            font-weight: 600;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button:hover { background-color: var(--primary-hover); }
+        button:disabled { background-color: #9ca3af; cursor: not-allowed; }
+        
+        .preview-box {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin-top: 20px;
+        }
+        canvas {
+            background: #000;
+            max-width: 100%;
+            height: auto;
+            border-radius: 8px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+        }
+        .status {
+            margin-top: 15px;
+            font-weight: 500;
+            color: #4b5563;
+            font-size: 14px;
+        }
+        .file-count {
+            margin-top: 10px;
+            font-size: 14px;
+            color: #059669;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>📸 純前端相片資料夾轉影片 App</h1>
+    
+    <div class="upload-zone" onclick="document.getElementById('folderInput').click()">
+        <p>📂 點擊這裡選擇包含相片的【資料夾】</p>
+        <p style="font-size: 12px; color: #64748b;">(相片只會在本地處理，絕不上載伺服器)</p>
+        <input type="file" id="folderInput" webkitdirectory directory multiple accept="image/*">
+        <div class="file-count" id="fileCount"></div>
+    </div>
+
+    <div class="controls">
+        <button id="btnPreview" disabled>▶️ 預覽 Slideshow</button>
+        <button id="btnRender" disabled>🎬 生成並下載影片</button>
+    </div>
+
+    <div class="preview-box">
+        <canvas id="videoCanvas" width="1280" height="720"></canvas>
+        <div class="status" id="statusText">請先選擇一個包含相片的資料夾。</div>
+    </div>
+</div>
+
+<script>
+    const folderInput = document.getElementById('folderInput');
+    const btnPreview = document.getElementById('btnPreview');
+    const btnRender = document.getElementById('btnRender');
+    const canvas = document.getElementById('videoCanvas');
+    const ctx = canvas.getContext('2d');
+    const statusText = document.getElementById('statusText');
+    const fileCountText = document.getElementById('fileCount');
+
+    let imageElements = [];
+    let isPlaying = false;
+    let animationFrameId = null;
+
+    const DISPLAY_DURATION = 3000; 
+    const FADE_DURATION = 500;     
+    const FPS = 30;
+
+    folderInput.addEventListener('change', async (e) => {
+        const files = Array.from(e.target.files);
+        const imgFiles = files.filter(file => file.type.startsWith('image/')).sort((a, b) => a.name.localeCompare(b.name));
+        
+        if (imgFiles.length === 0) {
+            alert('找不到任何圖片檔案，請重新選取資料夾。');
+            return;
+        }
+
+        fileCountText.innerText = `已成功讀取 ${imgFiles.length} 張相片，正在加載中...`;
+        statusText.innerText = "正在讀取圖片，請稍候...";
+        btnPreview.disabled = true;
+        btnRender.disabled = true;
+
+        imageElements = [];
+        for (let file of imgFiles) {
+            try {
+                const img = await loadImage(file);
+                imageElements.push(img);
+            } catch (err) {
+                console.error("載入相片失敗: ", file.name);
+            }
+        }
+
+        fileCountText.innerText = `✅ 成功載入 ${imageElements.length} 張相片！`;
+        statusText.innerText = "就緒。您可以點擊「預覽」或直接「生成影片」。";
+        btnPreview.disabled = false;
+        btnRender.disabled = false;
+        
+        if (imageElements.length > 0) drawImageCover(imageElements[0], 1);
+    });
+
+    function loadImage(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const img = new Image();
+                img.onload = () => resolve(img);
+                img.onerror = reject;
+                img.src = e.target.result;
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
+        });
+    }
+
+    function drawImageCover(img, alpha) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.save();
+        ctx.globalAlpha = alpha;
+
+        const canvasRatio = canvas.width / canvas.height;
+        const imgRatio = img.width / img.height;
+        let drawWidth, drawHeight, drawX, drawY;
+
+        if (imgRatio > canvasRatio) {
+            drawHeight = canvas.height;
+            drawWidth = img.width * (canvas.height / img.height);
+            drawX = (canvas.width - drawWidth) / 2;
+            drawY = 0;
+        } else {
+            drawWidth = canvas.width;
+            drawHeight = img.height * (canvas.width / img.width);
+            drawX = 0;
+            drawY = (canvas.height - drawHeight) / 2;
+        }
+
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, drawX, drawY, drawWidth, drawHeight);
+        ctx.restore();
+    }
+
+    function getAlphaForTime(timeInImg) {
+        if (timeInImg < FADE_DURATION) {
+            return timeInImg / FADE_DURATION;
+        } else if (timeInImg > DISPLAY_DURATION - FADE_DURATION) {
+            return (DISPLAY_DURATION - timeInImg) / FADE_DURATION;
+        }
+        return 1.0;
+    }
+
+    btnPreview.addEventListener('click', () => {
+        if (isPlaying) {
+            stopPreview();
+            return;
+        }
+        
+        isPlaying = true;
+        btnPreview.innerText = "⏹️ 停止預覽";
+        btnRender.disabled = true;
+        
+        let startTime = performance.now();
+        const totalDuration = imageElements.length * DISPLAY_DURATION;
+
+        function tick(now) {
+            if (!isPlaying) return;
+            let elapsed = now - startTime;
+
+            if (elapsed >= totalDuration) {
+                stopPreview();
+                return;
+            }
+
+            let imgIndex = Math.floor(elapsed / DISPLAY_DURATION);
+            let timeInImg = elapsed % DISPLAY_DURATION;
+            let alpha = getAlphaForTime(timeInImg);
+
+            drawImageCover(imageElements[imgIndex], alpha);
+            statusText.innerText = `正在預覽：第 ${imgIndex + 1} / ${imageElements.length} 張相片`;
+
+            animationFrameId = requestAnimationFrame(tick);
+        }
+        animationFrameId = requestAnimationFrame(tick);
+    });
+
+    function stopPreview() {
+        isPlaying = false;
+        if (animationFrameId) cancelAnimationFrame(animationFrameId);
+        btnPreview.innerText = "▶️ 預覽 Slideshow";
+        btnRender.disabled = false;
+        statusText.innerText = "預覽已停止。";
+        if (imageElements.length > 0) drawImageCover(imageElements[0], 1);
+    }
+
+    btnRender.addEventListener('click', () => {
+        btnPreview.disabled = true;
+        btnRender.disabled = true;
+        statusText.innerText = "🎬 正在生成影片，請勿關閉網頁...";
+
+        const stream = canvas.captureStream(FPS);
+        
+        let options = { mimeType: 'video/webm;codecs=vp9' };
+        if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+            options = { mimeType: 'video/webm;codecs=vp8' };
+        }
+        if (MediaRecorder.isTypeSupported('video/mp4')) {
+            options = { mimeType: 'video/mp4' };
+        }
+
+        const recorder = new MediaRecorder(stream, options);
+        const chunks = [];
+
+        recorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) chunks.push(e.data);
+        };
+
+        recorder.onstop = () => {
+            const blob = new Blob(chunks, { type: recorder.mimeType });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `slideshow_${Date.now()}.${options.mimeType.includes('mp4') ? 'mp4' : 'webm'}`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            
+            btnPreview.disabled = false;
+            btnRender.disabled = false;
+            statusText.innerText = "🎉 影片生成完畢，已自動開始下載！";
+        };
+
+        recorder.start();
+
+        let currentFrame = 0;
+        const totalFrames = (imageElements.length * DISPLAY_DURATION / 1000) * FPS;
+
+        function renderNextFrame() {
+            if (currentFrame >= totalFrames) {
+                setTimeout(() => {
+                    recorder.stop();
+                }, 500);
+                return;
+            }
+
+            let currentTimeMs = (currentFrame / FPS) * 1000;
+            let imgIndex = Math.floor(currentTimeMs / DISPLAY_DURATION);
+            let timeInImg = currentTimeMs % DISPLAY_DURATION;
+            let alpha = getAlphaForTime(timeInImg);
+
+            drawImageCover(imageElements[imgIndex], alpha);
+            
+            let percent = Math.floor((currentFrame / totalFrames) * 1000) / 10;
+            statusText.innerText = `🎬 影片錄製中：${percent}% (正在渲染第 ${imgIndex + 1} 張相片)`;
+
+            currentFrame++;
+            setTimeout(renderNextFrame, 1000 / FPS);
+        }
+
+        renderNextFrame();
+    });
+</script>
+
+</body>
+</html>
