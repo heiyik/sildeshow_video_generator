@@ -3,59 +3,75 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>相片 Slideshow 影片產生器</title>
+    <title>FFmpeg.wasm 相片 Slideshow 影片產生器</title>
+    <!-- 引入 FFmpeg.wasm v0.12 與工具庫 -->
+    <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
+    <script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
     <style>
         body {
             background-color: #DCE4EF;
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             color: #333;
-            max-width: 800px;
+            max-width: 850px;
             margin: 0 auto;
-            padding: 20px;
+            padding: 25px;
         }
         .container {
             background-color: white;
             padding: 30px;
             border-radius: 12px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.06);
         }
         h1 {
             text-align: center;
             color: #2c3e50;
+            margin-top: 0;
+        }
+        .badge {
+            display: inline-block;
+            background: #2c3e50;
+            color: #fff;
+            font-size: 12px;
+            padding: 4px 10px;
+            border-radius: 20px;
+            vertical-align: middle;
+            margin-left: 8px;
         }
         .form-group {
-            margin-bottom: 20px;
+            margin-bottom: 18px;
         }
         label {
             display: block;
-            margin-bottom: 8px;
-            font-weight: bold;
+            margin-bottom: 6px;
+            font-weight: 600;
+            color: #34495e;
         }
         input[type="file"], input[type="number"], select {
             width: 100%;
             padding: 10px;
-            border: 1px solid #ccc;
+            border: 1px solid #ccd1d9;
             border-radius: 6px;
             box-sizing: border-box;
             font-size: 14px;
+            background-color: #fafafa;
         }
-        .file-inputs {
-            display: flex;
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
             gap: 15px;
-        }
-        .file-inputs > div {
-            flex: 1;
         }
         button {
             background-color: #3498db;
             color: white;
             border: none;
-            padding: 12px 20px;
+            padding: 14px 20px;
             font-size: 16px;
+            font-weight: bold;
             border-radius: 6px;
             cursor: pointer;
             width: 100%;
-            transition: background-color 0.3s;
+            transition: background-color 0.25s;
+            margin-top: 10px;
         }
         button:hover {
             background-color: #2980b9;
@@ -65,20 +81,47 @@
             cursor: not-allowed;
         }
         .progress-container {
-            margin-top: 20px;
+            margin-top: 25px;
             display: none;
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #e9ecef;
+        }
+        .status-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-weight: bold;
+            color: #2c3e50;
         }
         progress {
             width: 100%;
-            height: 20px;
+            height: 22px;
+            border-radius: 6px;
+        }
+        .log-box {
+            margin-top: 12px;
+            background: #1e272e;
+            color: #0be881;
+            font-family: Consolas, Monaco, monospace;
+            font-size: 12px;
+            padding: 10px;
+            border-radius: 6px;
+            height: 110px;
+            overflow-y: auto;
+            white-space: pre-wrap;
         }
         .result-container {
-            margin-top: 20px;
+            margin-top: 25px;
             display: none;
             text-align: center;
+            border-top: 2px solid #eee;
+            padding-top: 20px;
         }
         video {
             width: 100%;
+            max-height: 480px;
             border-radius: 8px;
             background-color: black;
             margin-bottom: 15px;
@@ -87,31 +130,23 @@
             background-color: #27ae60;
             text-decoration: none;
             color: white;
-            padding: 12px 20px;
+            padding: 12px 28px;
             border-radius: 6px;
             display: inline-block;
             font-weight: bold;
+            transition: background 0.25s;
         }
         .download-btn:hover {
             background-color: #2ecc71;
-        }
-        /* 隱藏用於渲染的 Canvas */
-        #renderCanvas {
-            display: none; 
-        }
-        .note {
-            font-size: 0.85em;
-            color: #666;
-            margin-top: 5px;
         }
     </style>
 </head>
 <body>
 
 <div class="container">
-    <h1>相片 Slideshow 影片產生器</h1>
+    <h1>相片 Slideshow 產生器 <span class="badge">FFmpeg.wasm 版</span></h1>
     
-    <div class="form-group file-inputs">
+    <div class="form-group grid-2">
         <div>
             <label>1. 上傳相片資料夾 (Folder):</label>
             <input type="file" id="folderInput" webkitdirectory directory multiple accept="image/*">
@@ -122,250 +157,335 @@
         </div>
     </div>
 
-    <div class="form-group">
-        <label>2. 輸出影片格式:</label>
-        <select id="formatInput">
-            <option value="webm">WebM (相容性最佳)</option>
-            <option value="mp4">MP4 (H.264)</option>
-        </select>
+    <div class="form-group grid-2">
+        <div>
+            <label>2. 輸出影片格式:</label>
+            <select id="formatInput">
+                <option value="mp4">MP4 (H.264 - 100% 跨平台相容)</option>
+                <option value="webm">WebM (VP8)</option>
+            </select>
+        </div>
+        <div>
+            <label>3. 輸出解像度 (16:9 自動補黑邊):</label>
+            <select id="resInput">
+                <option value="1920x1080">1080p Full HD (1920x1080)</option>
+                <option value="3840x2160">4K Ultra HD (3840x2160 - 較耗時)</option>
+                <option value="1280x720">720p HD (1280x720 - 速度最快)</option>
+                <option value="auto">動態最高解像度 (自動偵測最大相片)</option>
+            </select>
+        </div>
     </div>
 
-    <div class="form-group">
-        <label>3. 每張相片顯示時長 (秒):</label>
-        <input type="number" id="durationInput" value="3" min="1" step="0.5">
+    <div class="form-group grid-2">
+        <div>
+            <label>4. 每張相片顯示時長 (秒):</label>
+            <input type="number" id="durationInput" value="3" min="1" step="0.5">
+        </div>
+        <div>
+            <label>5. 淡入淡出 Fade In/Out 時間 (秒):</label>
+            <input type="number" id="transitionInput" value="0.8" min="0.2" step="0.1">
+        </div>
     </div>
 
-    <div class="form-group">
-        <label>4. 過場 Fade In/Out 時間 (秒):</label>
-        <input type="number" id="transitionInput" value="1" min="0.1" step="0.1">
-    </div>
-
-    <button id="startBtn">開始生成影片</button>
+    <button id="startBtn">載入 FFmpeg 並生成影片</button>
 
     <div class="progress-container" id="progressContainer">
-        <label>影片錄製中 (實時渲染)... <span id="progressText">0%</span></label>
+        <div class="status-header">
+            <span id="statusText">準備中...</span>
+            <span id="progressText">0%</span>
+        </div>
         <progress id="progressBar" value="0" max="100"></progress>
-        <p class="note">* MediaRecorder API 需要實時錄製，請耐心等候。</p>
+        <div class="log-box" id="logBox">等待任務啟動...\n</div>
     </div>
 
     <div class="result-container" id="resultContainer">
-        <h3>錄製完成！</h3>
+        <h3>影片合成完成！</h3>
         <video id="previewVideo" controls></video>
         <br>
-        <a id="downloadLink" class="download-btn" download="slideshow.webm">下載影片</a>
+        <a id="downloadLink" class="download-btn" download="slideshow.mp4">下載高畫質影片</a>
     </div>
 </div>
 
-<canvas id="renderCanvas" width="1920" height="1080"></canvas>
+<!-- 離屏預處理 Canvas -->
+<canvas id="prepCanvas" style="display:none;"></canvas>
 
 <script>
+    const { FFmpeg } = FFmpegWASM;
+    const { toBlobURL } = FFmpegUtil;
+
     const folderInput = document.getElementById('folderInput');
     const filesInput = document.getElementById('filesInput');
     const formatInput = document.getElementById('formatInput');
+    const resInput = document.getElementById('resInput');
     const durationInput = document.getElementById('durationInput');
     const transitionInput = document.getElementById('transitionInput');
     const startBtn = document.getElementById('startBtn');
     
     const progressContainer = document.getElementById('progressContainer');
+    const statusText = document.getElementById('statusText');
     const progressBar = document.getElementById('progressBar');
     const progressText = document.getElementById('progressText');
+    const logBox = document.getElementById('logBox');
     
     const resultContainer = document.getElementById('resultContainer');
     const previewVideo = document.getElementById('previewVideo');
     const downloadLink = document.getElementById('downloadLink');
-    
-    const canvas = document.getElementById('renderCanvas');
-    const ctx = canvas.getContext('2d');
+    const prepCanvas = document.getElementById('prepCanvas');
+    const ctx = prepCanvas.getContext('2d');
 
     let imageFiles = [];
-    let loadedImages = [];
-    let mediaRecorder;
-    let recordedChunks = [];
-    let animationId;
+    let ffmpeg = null;
 
-    // 頁面載入時，檢查瀏覽器是否支援 MP4 錄製
-    window.addEventListener('DOMContentLoaded', () => {
-        const mp4Option = formatInput.querySelector('option[value="mp4"]');
-        if (!MediaRecorder.isTypeSupported('video/mp4')) {
-            mp4Option.disabled = true;
-            mp4Option.textContent = 'MP4 (您的瀏覽器不支援直接產出)';
-        }
-    });
+    function appendLog(msg) {
+        logBox.textContent += msg + '\n';
+        logBox.scrollTop = logBox.scrollHeight;
+    }
 
-    // 處理檔案選擇
+    function updateProgress(percent, status) {
+        const p = Math.min(100, Math.max(0, Math.round(percent)));
+        progressBar.value = p;
+        progressText.textContent = p + '%';
+        if (status) statusText.textContent = status;
+    }
+
+    // 處理檔案選擇與自然排序
     function handleFileSelect(e) {
         const files = Array.from(e.target.files).filter(file => file.type.startsWith('image/'));
         if (files.length > 0) {
             imageFiles = files;
-            // 按檔名自然排序 (支援數字順序如 1.jpg, 2.jpg, 10.jpg)
             imageFiles.sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'}));
-            startBtn.textContent = `開始生成影片 (已選擇 ${imageFiles.length} 張相片)`;
+            startBtn.textContent = `開始生成影片 (已排序 ${imageFiles.length} 張相片)`;
         }
     }
 
     folderInput.addEventListener('change', handleFileSelect);
     filesInput.addEventListener('change', handleFileSelect);
 
-    // 載入所有圖片至 Image 物件
-    async function loadImages() {
-        loadedImages = [];
-        for (const file of imageFiles) {
-            const img = new Image();
-            img.src = URL.createObjectURL(file);
-            await new Promise((resolve) => {
-                img.onload = resolve;
-                img.onerror = resolve; // 忽略損壞的圖片
-            });
-            loadedImages.push(img);
-        }
+    // 初始化並下載 FFmpeg.wasm 核心 (使用 toBlobURL 解決跨網域 Worker 限制)
+    async function initFFmpeg() {
+        if (ffmpeg && ffmpeg.loaded) return;
+
+        ffmpeg = new FFmpeg();
+        ffmpeg.on('log', ({ message }) => {
+            appendLog(message);
+        });
+
+        updateProgress(2, '正在下載 FFmpeg WebAssembly 核心 (首次約需 30MB)...');
+        appendLog('正在初始化 FFmpeg.wasm v0.12...');
+
+        // 為了解決 unpkg 相對路徑在 Blob Worker 內失效的問題，預先將 wasm 轉成 Blob URL 並注入腳本
+        const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+        const wasmBlobURL = await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm');
+        const workerBlobURL = await toBlobURL('https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/814.ffmpeg.js', 'text/javascript');
+        
+        const coreRes = await fetch(`${baseURL}/ffmpeg-core.js`);
+        let coreCode = await coreRes.text();
+        coreCode = coreCode.replace('ffmpeg-core.wasm', wasmBlobURL);
+        const coreBlobURL = URL.createObjectURL(new Blob([coreCode], { type: 'text/javascript' }));
+
+        await ffmpeg.load({
+            coreURL: coreBlobURL,
+            wasmURL: wasmBlobURL,
+            classWorkerURL: workerBlobURL
+        });
+
+        appendLog('FFmpeg 核心載入成功！');
     }
 
-    // 保持圖片比例並置中繪製 (Letterbox)
-    function drawImageLetterbox(img, alpha) {
-        const canvasAspect = canvas.width / canvas.height;
-        const imgAspect = img.width / img.height;
+    // 載入單張圖片物件
+    function loadImageObj(file) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            const url = URL.createObjectURL(file);
+            img.onload = () => {
+                URL.revokeObjectURL(url);
+                resolve(img);
+            };
+            img.onerror = reject;
+            img.src = url;
+        });
+    }
+
+    // 利用 Canvas 將圖片無損置中縮放 (Letterbox) 並轉為 Uint8Array
+    function renderNormalizedImage(img, targetW, targetH) {
+        prepCanvas.width = targetW;
+        prepCanvas.height = targetH;
+
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0, 0, targetW, targetH);
+
+        const canvasAspect = targetW / targetH;
+        const imgAspect = img.naturalWidth / img.naturalHeight;
         let w, h, x, y;
 
         if (imgAspect > canvasAspect) {
-            w = canvas.width;
-            h = canvas.width / imgAspect;
+            w = targetW;
+            h = targetW / imgAspect;
             x = 0;
-            y = (canvas.height - h) / 2;
+            y = (targetH - h) / 2;
         } else {
-            h = canvas.height;
-            w = canvas.height * imgAspect;
+            h = targetH;
+            w = targetH * imgAspect;
             y = 0;
-            x = (canvas.width - w) / 2;
+            x = (targetW - w) / 2;
         }
 
-        ctx.globalAlpha = alpha;
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(img, x, y, w, h);
-        ctx.globalAlpha = 1.0; 
+
+        return new Promise((resolve) => {
+            prepCanvas.toBlob(async (blob) => {
+                const buf = await blob.arrayBuffer();
+                resolve(new Uint8Array(buf));
+            }, 'image/jpeg', 0.95);
+        });
     }
 
     startBtn.addEventListener('click', async () => {
         if (imageFiles.length === 0) {
-            alert('請先上傳相片資料夾或多張相片！');
+            alert('請先上傳相片資料夾或選擇多張相片！');
             return;
         }
 
-        const durationPerImage = parseFloat(durationInput.value) * 1000;
-        const transitionTime = parseFloat(transitionInput.value) * 1000;
+        const duration = parseFloat(durationInput.value);
+        const fadeTime = parseFloat(transitionInput.value);
 
-        if (transitionTime >= durationPerImage) {
-            alert('過場時間必須小於每張相片的顯示時長！');
+        if (fadeTime * 2 >= duration) {
+            alert('過場時間 (Fade In + Fade Out) 的總和不能大於或等於每張相片的顯示時長！\n例如顯示 3 秒，過場建議設為 0.5 ~ 1.2 秒。');
             return;
         }
 
-        // 初始化 UI
         startBtn.disabled = true;
         resultContainer.style.display = 'none';
         progressContainer.style.display = 'block';
-        progressBar.value = 0;
-        progressText.innerText = '載入圖片中...';
+        logBox.textContent = '';
 
-        await loadImages();
-        
-        if (loadedImages.length === 0) {
-            alert('無法載入有效的圖片。');
-            startBtn.disabled = false;
-            return;
-        }
+        try {
+            await initFFmpeg();
 
-        const totalDuration = loadedImages.length * durationPerImage;
-        let startTime = null;
-        recordedChunks = [];
+            // 1. 決定目標輸出解像度 (H.264 要求寬高必須是偶數)
+            let targetW = 1920;
+            let targetH = 1080;
 
-        // 設置 Canvas 錄製串流 (30 FPS)
-        const stream = canvas.captureStream(30);
-        
-        // 根據使用者選擇設定 MimeType
-        let options = {};
-        let fileExtension = formatInput.value;
-        const selectedFormat = formatInput.value;
-
-        if (selectedFormat === 'mp4' && MediaRecorder.isTypeSupported('video/mp4')) {
-            options = { mimeType: 'video/mp4' };
-        } else {
-            // WebM fallback：優先嘗試使用 H.264 編碼的 WebM (畫質/相容性較佳)，其次才用預設 WebM
-            if (MediaRecorder.isTypeSupported('video/webm; codecs=h264')) {
-                options = { mimeType: 'video/webm; codecs=h264' };
+            if (resInput.value === 'auto') {
+                updateProgress(8, '正在掃描相片最高解像度...');
+                let maxW = 1280, maxH = 720;
+                for (const file of imageFiles) {
+                    const img = await loadImageObj(file);
+                    if (img.naturalWidth > maxW) maxW = img.naturalWidth;
+                    if (img.naturalHeight > maxH) maxH = img.naturalHeight;
+                }
+                // 限制最大不超過 4K (3840x2160) 以免瀏覽器 WASM 記憶體溢出，並維持 16:9 偶數像素
+                targetW = Math.min(3840, maxW);
+                targetH = Math.round((targetW * 9) / 16);
             } else {
-                options = { mimeType: 'video/webm' };
+                const parts = resInput.value.split('x');
+                targetW = parseInt(parts[0], 10);
+                targetH = parseInt(parts[1], 10);
             }
-            fileExtension = 'webm';
-        }
-        
-        mediaRecorder = new MediaRecorder(stream, options);
+            // 確保寬高為偶數 (yuv420p 編碼強制要求)
+            targetW = targetW % 2 === 0 ? targetW : targetW - 1;
+            targetH = targetH % 2 === 0 ? targetH : targetH - 1;
 
-        mediaRecorder.ondataavailable = function(e) {
-            if (e.data.size > 0) recordedChunks.push(e.data);
-        };
+            appendLog(`目標輸出解像度設定為: ${targetW}x${targetH}`);
 
-        mediaRecorder.onstop = function() {
-            const blob = new Blob(recordedChunks, { type: options.mimeType });
-            const videoURL = URL.createObjectURL(blob);
-            
+            const format = formatInput.value;
+            const ext = format === 'mp4' ? 'mp4' : 'webm';
+            const totalImgs = imageFiles.length;
+            let concatListText = '';
+
+            // 2. 逐張相片進行 Letterbox 預處理並編碼成獨立 Fade-in / Fade-out 片段
+            for (let i = 0; i < totalImgs; i++) {
+                const stepBaseProgress = 10 + (i / totalImgs) * 80;
+                updateProgress(stepBaseProgress, `正在處理並編碼第 ${i + 1} / ${totalImgs} 張相片 (${imageFiles[i].name})...`);
+
+                const img = await loadImageObj(imageFiles[i]);
+                const imgBytes = await renderNormalizedImage(img, targetW, targetH);
+
+                const inputName = `slide_${i}.jpg`;
+                const segName = `seg_${i}.${ext}`;
+                await ffmpeg.writeFile(inputName, imgBytes);
+
+                const fadeOutStart = (duration - fadeTime).toFixed(2);
+                const vfFilter = `fade=t=in:st=0:d=${fadeTime},fade=t=out:st=${fadeOutStart}:d=${fadeTime},format=yuv420p`;
+
+                let ffmpegArgs = [];
+                if (format === 'mp4') {
+                    ffmpegArgs = [
+                        '-loop', '1',
+                        '-framerate', '30',
+                        '-i', inputName,
+                        '-t', duration.toString(),
+                        '-vf', vfFilter,
+                        '-c:v', 'libx264',
+                        '-preset', 'ultrafast',
+                        '-crf', '20',
+                        segName
+                    ];
+                } else {
+                    ffmpegArgs = [
+                        '-loop', '1',
+                        '-framerate', '30',
+                        '-i', inputName,
+                        '-t', duration.toString(),
+                        '-vf', vfFilter,
+                        '-c:v', 'libvpx',
+                        '-b:v', '4M',
+                        segName
+                    ];
+                }
+
+                await ffmpeg.exec(ffmpegArgs);
+                // 立即刪除虛擬系統中的圖片以釋放記憶體
+                await ffmpeg.deleteFile(inputName);
+
+                concatListText += `file '${segName}'\n`;
+            }
+
+            // 3. 將所有片段進行無損極速合併 (Stream Copy)
+            updateProgress(92, '正在無損合併所有影片片段...');
+            await ffmpeg.writeFile('list.txt', concatListText);
+
+            const outputFileName = `output.${ext}`;
+            await ffmpeg.exec([
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', 'list.txt',
+                '-c', 'copy',
+                outputFileName
+            ]);
+
+            updateProgress(98, '正在匯出最終影片檔案...');
+            const data = await ffmpeg.readFile(outputFileName);
+
+            // 清理虛擬檔案系統中的分段檔
+            for (let i = 0; i < totalImgs; i++) {
+                await ffmpeg.deleteFile(`seg_${i}.${ext}`);
+            }
+            await ffmpeg.deleteFile('list.txt');
+            await ffmpeg.deleteFile(outputFileName);
+
+            // 4. 產生預覽與下載連結
+            const mimeType = format === 'mp4' ? 'video/mp4' : 'video/webm';
+            const videoBlob = new Blob([data.buffer], { type: mimeType });
+            const videoURL = URL.createObjectURL(videoBlob);
+
             previewVideo.src = videoURL;
             downloadLink.href = videoURL;
-            
-            // 更新下載按鈕資訊
-            downloadLink.download = `slideshow.${fileExtension}`;
-            downloadLink.textContent = `下載影片 (${fileExtension.toUpperCase()})`;
-            
-            progressContainer.style.display = 'none';
+            downloadLink.download = `slideshow_${targetW}x${targetH}.${ext}`;
+            downloadLink.textContent = `下載高畫質影片 (${ext.toUpperCase()} - ${targetW}x${targetH})`;
+
+            updateProgress(100, '完成！');
             resultContainer.style.display = 'block';
+
+        } catch (err) {
+            console.error(err);
+            appendLog('\n[錯誤] ' + err.message);
+            alert('生成過程中發生錯誤，請確認您是使用 Local Server (http://localhost) 開啟此網頁，並查看下方黑框日誌。');
+        } finally {
             startBtn.disabled = false;
-            startBtn.textContent = '重新生成影片';
-        };
-
-        // 開始錄製
-        mediaRecorder.start();
-
-        // Canvas 動畫渲染迴圈
-        function renderFrame(timestamp) {
-            if (!startTime) startTime = timestamp;
-            const elapsed = timestamp - startTime;
-
-            // 檢查是否已達到總時長，是則停止錄製
-            if (elapsed >= totalDuration) {
-                mediaRecorder.stop();
-                return; 
-            }
-
-            const currentIndex = Math.floor(elapsed / durationPerImage);
-            const timeInSlide = elapsed % durationPerImage;
-
-            // 畫布塗黑 (背景)
-            ctx.fillStyle = 'black';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-            // 動畫與過場邏輯 (Crossfade)
-            if (timeInSlide < transitionTime) {
-                if (currentIndex === 0) {
-                    const alpha = timeInSlide / transitionTime;
-                    drawImageLetterbox(loadedImages[currentIndex], alpha);
-                } else {
-                    const alpha = timeInSlide / transitionTime;
-                    drawImageLetterbox(loadedImages[currentIndex - 1], 1 - alpha);
-                    drawImageLetterbox(loadedImages[currentIndex], alpha);
-                }
-            } else if (currentIndex === loadedImages.length - 1 && timeInSlide > durationPerImage - transitionTime) {
-                const alpha = (durationPerImage - timeInSlide) / transitionTime;
-                drawImageLetterbox(loadedImages[currentIndex], alpha);
-            } else {
-                drawImageLetterbox(loadedImages[currentIndex], 1);
-            }
-
-            // 更新進度條
-            const percent = Math.min(100, Math.floor((elapsed / totalDuration) * 100));
-            progressBar.value = percent;
-            progressText.innerText = percent + '%';
-
-            animationId = requestAnimationFrame(renderFrame);
         }
-
-        animationId = requestAnimationFrame(renderFrame);
     });
 </script>
 
