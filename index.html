@@ -4,9 +4,24 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FFmpeg.wasm 相片 Slideshow 影片產生器</title>
-    <!-- 引入 FFmpeg.wasm v0.12 與工具庫 -->
-    <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
-    <script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
+    
+    <!-- 關鍵修復：全域攔截跨網域 Worker，自動轉為同源 Blob Worker 解決 Cross-Origin 報錯 -->
+    <script>
+        const OriginalWorker = window.Worker;
+        window.Worker = function(scriptURL, options) {
+            const urlStr = scriptURL.toString();
+            if (urlStr.startsWith('http://') || urlStr.startsWith('https://')) {
+                // 將外部 CDN 的 Worker 轉換為同源 Blob Worker
+                const blobCode = `importScripts("${urlStr}");`;
+                const blob = new Blob([blobCode], { type: 'application/javascript' });
+                return new OriginalWorker(URL.createObjectURL(blob), options);
+            }
+            return new OriginalWorker(scriptURL, options);
+        };
+    </script>
+
+    <!-- 引入 FFmpeg.wasm v0.12 -->
+    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
     <style>
         body {
             background-color: #DCE4EF;
@@ -108,7 +123,7 @@
             font-size: 12px;
             padding: 10px;
             border-radius: 6px;
-            height: 110px;
+            height: 140px;
             overflow-y: auto;
             white-space: pre-wrap;
         }
@@ -206,12 +221,10 @@
     </div>
 </div>
 
-<!-- 離屏預處理 Canvas -->
 <canvas id="prepCanvas" style="display:none;"></canvas>
 
 <script>
     const { FFmpeg } = FFmpegWASM;
-    const { toBlobURL } = FFmpegUtil;
 
     const folderInput = document.getElementById('folderInput');
     const filesInput = document.getElementById('filesInput');
@@ -248,7 +261,6 @@
         if (status) statusText.textContent = status;
     }
 
-    // 處理檔案選擇與自然排序
     function handleFileSelect(e) {
         const files = Array.from(e.target.files).filter(file => file.type.startsWith('image/'));
         if (files.length > 0) {
@@ -261,7 +273,77 @@
     folderInput.addEventListener('change', handleFileSelect);
     filesInput.addEventListener('change', handleFileSelect);
 
-    // 初始化並下載 FFmpeg.wasm 核心 (使用 toBlobURL 解決跨網域 Worker 限制)
+    // IndexedDB 快取管理 (讓 32MB WASM 核心只需下載一次)
+    function openCacheDB() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open('FFmpegCacheDB', 1);
+            req.onupgradeneeded = (e) => e.target.result.createObjectStore('files');
+            req.onsuccess = (e) => resolve(e.target.result);
+            req.onerror = reject;
+        });
+    }
+
+    async function getCachedBlob(key) {
+        try {
+            const db = await openCacheDB();
+            return new Promise((resolve) => {
+                const tx = db.transaction('files', 'readonly');
+                const req = tx.objectStore('files').get(key);
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => resolve(null);
+            });
+        } catch { return null; }
+    }
+
+    async function setCachedBlob(key, blob) {
+        try {
+            const db = await openCacheDB();
+            const tx = db.transaction('files', 'readwrite');
+            tx.objectStore('files').put(blob, key);
+        } catch (e) { console.warn('快取寫入失敗', e); }
+    }
+
+    // 支援 IndexedDB 快取與即時串流下載進度顯示的 Blob URL 產生器
+    async function fetchWithProgressAndCache(url, mimeType, label, startPct, endPct) {
+        const cached = await getCachedBlob(url);
+        if (cached) {
+            appendLog(`[IndexedDB] 已從本機快取秒速載入 ${label}！`);
+            updateProgress(endPct, `已從快取載入 ${label}`);
+            return URL.createObjectURL(new Blob([cached], { type: mimeType }));
+        }
+
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`無法下載 ${label} (${response.status})`);
+        
+        const contentLength = response.headers.get('content-length');
+        if (!contentLength || !response.body) {
+            const blob = await response.blob();
+            await setCachedBlob(url, blob);
+            return URL.createObjectURL(new Blob([blob], { type: mimeType }));
+        }
+
+        const total = parseInt(contentLength, 10);
+        let loaded = 0;
+        const reader = response.body.getReader();
+        const chunks = [];
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            loaded += value.length;
+            const ratio = loaded / total;
+            const currentPct = startPct + ratio * (endPct - startPct);
+            const mbLoaded = (loaded / 1024 / 1024).toFixed(1);
+            const mbTotal = (total / 1024 / 1024).toFixed(1);
+            updateProgress(currentPct, `正在下載 ${label}... (${mbLoaded} MB / ${mbTotal} MB)`);
+        }
+
+        const blob = new Blob(chunks, { type: mimeType });
+        await setCachedBlob(url, blob);
+        return URL.createObjectURL(blob);
+    }
+
     async function initFFmpeg() {
         if (ffmpeg && ffmpeg.loaded) return;
 
@@ -270,29 +352,39 @@
             appendLog(message);
         });
 
-        updateProgress(2, '正在下載 FFmpeg WebAssembly 核心 (首次約需 30MB)...');
-        appendLog('正在初始化 FFmpeg.wasm v0.12...');
+        appendLog('正在準備 FFmpeg WebAssembly 核心...');
 
-        // 為了解決 unpkg 相對路徑在 Blob Worker 內失效的問題，預先將 wasm 轉成 Blob URL 並注入腳本
-        const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
-        const wasmBlobURL = await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm');
-        const workerBlobURL = await toBlobURL('https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/814.ffmpeg.js', 'text/javascript');
-        
-        const coreRes = await fetch(`${baseURL}/ffmpeg-core.js`);
-        let coreCode = await coreRes.text();
-        coreCode = coreCode.replace('ffmpeg-core.wasm', wasmBlobURL);
-        const coreBlobURL = URL.createObjectURL(new Blob([coreCode], { type: 'text/javascript' }));
+        const coreBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
 
+        // 1. 下載 (或從 IndexedDB 讀取) 32MB 的 .wasm 核心
+        const wasmBlobURL = await fetchWithProgressAndCache(
+            `${coreBase}/ffmpeg-core.wasm`,
+            'application/wasm',
+            'FFmpeg WASM 引擎',
+            2, 18
+        );
+
+        // 2. 下載核心 JS
+        updateProgress(19, '正在配置 FFmpeg 核心腳本...');
+        const coreBlobURL = await fetchWithProgressAndCache(
+            `${coreBase}/ffmpeg-core.js`,
+            'text/javascript',
+            'FFmpeg Core JS',
+            18, 20
+        );
+
+        updateProgress(20, '正在啟動 WebAssembly 虛擬機器...');
+        appendLog('正在啟動 FFmpeg Worker...');
+
+        // 配合頂部的 window.Worker 攔截器，直接傳入 coreURL 與 wasmURL 即可完美啟動
         await ffmpeg.load({
             coreURL: coreBlobURL,
-            wasmURL: wasmBlobURL,
-            classWorkerURL: workerBlobURL
+            wasmURL: wasmBlobURL
         });
 
-        appendLog('FFmpeg 核心載入成功！');
+        appendLog('FFmpeg 核心載入並啟動成功！');
     }
 
-    // 載入單張圖片物件
     function loadImageObj(file) {
         return new Promise((resolve, reject) => {
             const img = new Image();
@@ -306,7 +398,6 @@
         });
     }
 
-    // 利用 Canvas 將圖片無損置中縮放 (Letterbox) 並轉為 Uint8Array
     function renderNormalizedImage(img, targetW, targetH) {
         prepCanvas.width = targetW;
         prepCanvas.height = targetH;
@@ -352,7 +443,7 @@
         const fadeTime = parseFloat(transitionInput.value);
 
         if (fadeTime * 2 >= duration) {
-            alert('過場時間 (Fade In + Fade Out) 的總和不能大於或等於每張相片的顯示時長！\n例如顯示 3 秒，過場建議設為 0.5 ~ 1.2 秒。');
+            alert('過場時間 (Fade In + Fade Out) 的總和不能大於或等於每張相片的顯示時長！');
             return;
         }
 
@@ -364,19 +455,17 @@
         try {
             await initFFmpeg();
 
-            // 1. 決定目標輸出解像度 (H.264 要求寬高必須是偶數)
             let targetW = 1920;
             let targetH = 1080;
 
             if (resInput.value === 'auto') {
-                updateProgress(8, '正在掃描相片最高解像度...');
+                updateProgress(22, '正在掃描相片最高解像度...');
                 let maxW = 1280, maxH = 720;
                 for (const file of imageFiles) {
                     const img = await loadImageObj(file);
                     if (img.naturalWidth > maxW) maxW = img.naturalWidth;
                     if (img.naturalHeight > maxH) maxH = img.naturalHeight;
                 }
-                // 限制最大不超過 4K (3840x2160) 以免瀏覽器 WASM 記憶體溢出，並維持 16:9 偶數像素
                 targetW = Math.min(3840, maxW);
                 targetH = Math.round((targetW * 9) / 16);
             } else {
@@ -384,7 +473,6 @@
                 targetW = parseInt(parts[0], 10);
                 targetH = parseInt(parts[1], 10);
             }
-            // 確保寬高為偶數 (yuv420p 編碼強制要求)
             targetW = targetW % 2 === 0 ? targetW : targetW - 1;
             targetH = targetH % 2 === 0 ? targetH : targetH - 1;
 
@@ -395,9 +483,8 @@
             const totalImgs = imageFiles.length;
             let concatListText = '';
 
-            // 2. 逐張相片進行 Letterbox 預處理並編碼成獨立 Fade-in / Fade-out 片段
             for (let i = 0; i < totalImgs; i++) {
-                const stepBaseProgress = 10 + (i / totalImgs) * 80;
+                const stepBaseProgress = 25 + (i / totalImgs) * 65;
                 updateProgress(stepBaseProgress, `正在處理並編碼第 ${i + 1} / ${totalImgs} 張相片 (${imageFiles[i].name})...`);
 
                 const img = await loadImageObj(imageFiles[i]);
@@ -437,13 +524,11 @@
                 }
 
                 await ffmpeg.exec(ffmpegArgs);
-                // 立即刪除虛擬系統中的圖片以釋放記憶體
                 await ffmpeg.deleteFile(inputName);
 
                 concatListText += `file '${segName}'\n`;
             }
 
-            // 3. 將所有片段進行無損極速合併 (Stream Copy)
             updateProgress(92, '正在無損合併所有影片片段...');
             await ffmpeg.writeFile('list.txt', concatListText);
 
@@ -459,14 +544,12 @@
             updateProgress(98, '正在匯出最終影片檔案...');
             const data = await ffmpeg.readFile(outputFileName);
 
-            // 清理虛擬檔案系統中的分段檔
             for (let i = 0; i < totalImgs; i++) {
                 await ffmpeg.deleteFile(`seg_${i}.${ext}`);
             }
             await ffmpeg.deleteFile('list.txt');
             await ffmpeg.deleteFile(outputFileName);
 
-            // 4. 產生預覽與下載連結
             const mimeType = format === 'mp4' ? 'video/mp4' : 'video/webm';
             const videoBlob = new Blob([data.buffer], { type: mimeType });
             const videoURL = URL.createObjectURL(videoBlob);
@@ -482,7 +565,7 @@
         } catch (err) {
             console.error(err);
             appendLog('\n[錯誤] ' + err.message);
-            alert('生成過程中發生錯誤，請確認您是使用 Local Server (http://localhost) 開啟此網頁，並查看下方黑框日誌。');
+            alert('生成過程中發生錯誤：' + err.message);
         } finally {
             startBtn.disabled = false;
         }
