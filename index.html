@@ -3,15 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FFmpeg.wasm 相片 Slideshow 影片產生器</title>
+    <title>FFmpeg.wasm 相片 Slideshow 產生器 (支援手機背景執行)</title>
     
-    <!-- 關鍵修復：全域攔截跨網域 Worker，自動轉為同源 Blob Worker 解決 Cross-Origin 報錯 -->
+    <!-- 全域攔截跨網域 Worker，自動轉為同源 Blob Worker -->
     <script>
         const OriginalWorker = window.Worker;
         window.Worker = function(scriptURL, options) {
             const urlStr = scriptURL.toString();
             if (urlStr.startsWith('http://') || urlStr.startsWith('https://')) {
-                // 將外部 CDN 的 Worker 轉換為同源 Blob Worker
                 const blobCode = `importScripts("${urlStr}");`;
                 const blob = new Blob([blobCode], { type: 'application/javascript' });
                 return new OriginalWorker(URL.createObjectURL(blob), options);
@@ -20,7 +19,6 @@
         };
     </script>
 
-    <!-- 引入 FFmpeg.wasm v0.12 -->
     <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
     <style>
         body {
@@ -29,11 +27,11 @@
             color: #333;
             max-width: 850px;
             margin: 0 auto;
-            padding: 25px;
+            padding: 20px;
         }
         .container {
             background-color: white;
-            padding: 30px;
+            padding: 25px;
             border-radius: 12px;
             box-shadow: 0 6px 20px rgba(0,0,0,0.06);
         }
@@ -41,19 +39,20 @@
             text-align: center;
             color: #2c3e50;
             margin-top: 0;
+            font-size: 1.5rem;
         }
         .badge {
             display: inline-block;
-            background: #2c3e50;
+            background: #8e44ad;
             color: #fff;
             font-size: 12px;
             padding: 4px 10px;
             border-radius: 20px;
             vertical-align: middle;
-            margin-left: 8px;
+            margin-left: 6px;
         }
         .form-group {
-            margin-bottom: 18px;
+            margin-bottom: 16px;
         }
         label {
             display: block;
@@ -75,6 +74,9 @@
             grid-template-columns: 1fr 1fr;
             gap: 15px;
         }
+        @media (max-width: 600px) {
+            .grid-2 { grid-template-columns: 1fr; }
+        }
         button {
             background-color: #3498db;
             color: white;
@@ -88,13 +90,8 @@
             transition: background-color 0.25s;
             margin-top: 10px;
         }
-        button:hover {
-            background-color: #2980b9;
-        }
-        button:disabled {
-            background-color: #95a5a6;
-            cursor: not-allowed;
-        }
+        button:hover { background-color: #2980b9; }
+        button:disabled { background-color: #95a5a6; cursor: not-allowed; }
         .progress-container {
             margin-top: 25px;
             display: none;
@@ -149,17 +146,13 @@
             border-radius: 6px;
             display: inline-block;
             font-weight: bold;
-            transition: background 0.25s;
-        }
-        .download-btn:hover {
-            background-color: #2ecc71;
         }
     </style>
 </head>
 <body>
 
 <div class="container">
-    <h1>相片 Slideshow 產生器 <span class="badge">FFmpeg.wasm 版</span></h1>
+    <h1>相片 Slideshow 產生器 <span class="badge">支援手機鎖屏背景執行</span></h1>
     
     <div class="form-group grid-2">
         <div>
@@ -167,7 +160,7 @@
             <input type="file" id="folderInput" webkitdirectory directory multiple accept="image/*">
         </div>
         <div>
-            <label>或 選擇多張相片 (Files):</label>
+            <label>或 選擇多張相片 (手機建議用此項):</label>
             <input type="file" id="filesInput" multiple accept="image/*">
         </div>
     </div>
@@ -184,8 +177,8 @@
             <label>3. 輸出解像度 (16:9 自動補黑邊):</label>
             <select id="resInput">
                 <option value="1920x1080">1080p Full HD (1920x1080)</option>
-                <option value="3840x2160">4K Ultra HD (3840x2160 - 較耗時)</option>
-                <option value="1280x720">720p HD (1280x720 - 速度最快)</option>
+                <option value="1280x720">720p HD (1280x720 - 手機推薦)</option>
+                <option value="3840x2160">4K Ultra HD (3840x2160)</option>
                 <option value="auto">動態最高解像度 (自動偵測最大相片)</option>
             </select>
         </div>
@@ -202,7 +195,7 @@
         </div>
     </div>
 
-    <button id="startBtn">載入 FFmpeg 並生成影片</button>
+    <button id="startBtn">開始生成影片 (支援背景與鎖屏運行)</button>
 
     <div class="progress-container" id="progressContainer">
         <div class="status-header">
@@ -215,7 +208,7 @@
 
     <div class="result-container" id="resultContainer">
         <h3>影片合成完成！</h3>
-        <video id="previewVideo" controls></video>
+        <video id="previewVideo" controls playsinline></video>
         <br>
         <a id="downloadLink" class="download-btn" download="slideshow.mp4">下載高畫質影片</a>
     </div>
@@ -249,6 +242,88 @@
     let imageFiles = [];
     let ffmpeg = null;
 
+    // === 背景續命與防休眠模組 (Wake Lock + Web Audio Keep-Alive) ===
+    let wakeLock = null;
+    let keepAliveAudio = null;
+    let audioCtx = null;
+
+    // 產生一段 1 秒鐘極低音量的 WAV 音訊 Blob，欺騙手機系統目前正在播放媒體
+    function createNearSilentWavBlob() {
+        const sampleRate = 8000;
+        const numSamples = sampleRate * 1;
+        const buffer = new ArrayBuffer(44 + numSamples * 2);
+        const view = new DataView(buffer);
+        const writeString = (offset, str) => {
+            for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+        };
+        writeString(0, 'RIFF');
+        view.setUint32(4, 36 + numSamples * 2, true);
+        writeString(8, 'WAVE');
+        writeString(12, 'fmt ');
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, 1, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, sampleRate * 2, true);
+        view.setUint16(32, 2, true);
+        view.setUint16(34, 16, true);
+        writeString(36, 'data');
+        view.setUint32(40, numSamples * 2, true);
+        // 填入極微弱的振幅 (1)，避免被 iOS/Android 判定為純靜音(0)而切斷背景權限
+        for (let i = 0; i < numSamples; i++) {
+            view.setInt16(44 + i * 2, (i % 2 === 0) ? 1 : -1, true);
+        }
+        return new Blob([buffer], { type: 'audio/wav' });
+    }
+
+    async function enableBackgroundExecution() {
+        // 1. 啟動螢幕常亮鎖 (防止手機自動黑屏)
+        if ('wakeLock' in navigator) {
+            try {
+                wakeLock = await navigator.wakeLock.request('screen');
+                appendLog('[背景守護] 已啟用螢幕常亮鎖 (Screen Wake Lock)。');
+            } catch (e) {}
+        }
+
+        // 2. 啟動無聲音樂播放器 (確保使用者手動鎖屏或切換 App 時，CPU 仍全速運作)
+        try {
+            if (!keepAliveAudio) {
+                keepAliveAudio = new Audio(URL.createObjectURL(createNearSilentWavBlob()));
+                keepAliveAudio.loop = true;
+                keepAliveAudio.volume = 0.01;
+            }
+            await keepAliveAudio.play();
+
+            // 註冊手機鎖屏通知列狀態，提升系統背景優先權
+            if ('mediaSession' in navigator) {
+                navigator.mediaSession.metadata = new MediaMetadata({
+                    title: '正在背景合成 Slideshow 影片...',
+                    artist: 'FFmpeg.wasm 背景引擎運作中',
+                    album: '請勿關閉此瀏覽器分頁'
+                });
+                navigator.mediaSession.playbackState = 'playing';
+            }
+            appendLog('[背景守護] 已啟動背景音訊續命模式，現在鎖上螢幕或切換 App 仍會繼續運算！');
+        } catch (e) {
+            console.warn('背景音訊啟動失敗:', e);
+        }
+    }
+
+    async function disableBackgroundExecution() {
+        if (wakeLock) {
+            try { await wakeLock.release(); } catch (e) {}
+            wakeLock = null;
+        }
+        if (keepAliveAudio) {
+            keepAliveAudio.pause();
+            if ('mediaSession' in navigator) {
+                navigator.mediaSession.playbackState = 'none';
+            }
+        }
+        appendLog('[背景守護] 任務結束，已釋放背景與螢幕鎖定。');
+    }
+    // ==============================================================
+
     function appendLog(msg) {
         logBox.textContent += msg + '\n';
         logBox.scrollTop = logBox.scrollHeight;
@@ -258,7 +333,13 @@
         const p = Math.min(100, Math.max(0, Math.round(percent)));
         progressBar.value = p;
         progressText.textContent = p + '%';
-        if (status) statusText.textContent = status;
+        if (status) {
+            statusText.textContent = status;
+            // 同步更新手機鎖屏畫面上的進度標題
+            if ('mediaSession' in navigator && navigator.mediaSession.metadata) {
+                navigator.mediaSession.metadata.title = `[${p}%] ${status}`;
+            }
+        }
     }
 
     function handleFileSelect(e) {
@@ -273,7 +354,6 @@
     folderInput.addEventListener('change', handleFileSelect);
     filesInput.addEventListener('change', handleFileSelect);
 
-    // IndexedDB 快取管理 (讓 32MB WASM 核心只需下載一次)
     function openCacheDB() {
         return new Promise((resolve, reject) => {
             const req = indexedDB.open('FFmpegCacheDB', 1);
@@ -300,10 +380,9 @@
             const db = await openCacheDB();
             const tx = db.transaction('files', 'readwrite');
             tx.objectStore('files').put(blob, key);
-        } catch (e) { console.warn('快取寫入失敗', e); }
+        } catch (e) {}
     }
 
-    // 支援 IndexedDB 快取與即時串流下載進度顯示的 Blob URL 產生器
     async function fetchWithProgressAndCache(url, mimeType, label, startPct, endPct) {
         const cached = await getCachedBlob(url);
         if (cached) {
@@ -352,37 +431,28 @@
             appendLog(message);
         });
 
-        appendLog('正在準備 FFmpeg WebAssembly 核心...');
-
         const coreBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
 
-        // 1. 下載 (或從 IndexedDB 讀取) 32MB 的 .wasm 核心
         const wasmBlobURL = await fetchWithProgressAndCache(
             `${coreBase}/ffmpeg-core.wasm`,
             'application/wasm',
             'FFmpeg WASM 引擎',
-            2, 18
+            2, 14
         );
 
-        // 2. 下載核心 JS
-        updateProgress(19, '正在配置 FFmpeg 核心腳本...');
         const coreBlobURL = await fetchWithProgressAndCache(
             `${coreBase}/ffmpeg-core.js`,
             'text/javascript',
             'FFmpeg Core JS',
-            18, 20
+            14, 16
         );
 
-        updateProgress(20, '正在啟動 WebAssembly 虛擬機器...');
-        appendLog('正在啟動 FFmpeg Worker...');
-
-        // 配合頂部的 window.Worker 攔截器，直接傳入 coreURL 與 wasmURL 即可完美啟動
+        updateProgress(17, '正在啟動 WebAssembly 虛擬機器...');
         await ffmpeg.load({
             coreURL: coreBlobURL,
             wasmURL: wasmBlobURL
         });
-
-        appendLog('FFmpeg 核心載入並啟動成功！');
+        appendLog('FFmpeg 核心啟動成功！');
     }
 
     function loadImageObj(file) {
@@ -452,6 +522,9 @@
         progressContainer.style.display = 'block';
         logBox.textContent = '';
 
+        // 必須在使用者點擊按鈕的當下立刻啟動背景音訊與防休眠鎖
+        await enableBackgroundExecution();
+
         try {
             await initFFmpeg();
 
@@ -459,7 +532,7 @@
             let targetH = 1080;
 
             if (resInput.value === 'auto') {
-                updateProgress(22, '正在掃描相片最高解像度...');
+                updateProgress(18, '正在掃描相片最高解像度...');
                 let maxW = 1280, maxH = 720;
                 for (const file of imageFiles) {
                     const img = await loadImageObj(file);
@@ -476,24 +549,31 @@
             targetW = targetW % 2 === 0 ? targetW : targetW - 1;
             targetH = targetH % 2 === 0 ? targetH : targetH - 1;
 
-            appendLog(`目標輸出解像度設定為: ${targetW}x${targetH}`);
+            const totalImgs = imageFiles.length;
+
+            // 階段一：趁使用者還在畫面上，優先將所有相片預處理並寫入 FFmpeg 記憶體
+            // 這樣接下來就算鎖屏導致 DOM Canvas 被凍結，FFmpeg Worker 也能獨立在背景跑完！
+            for (let i = 0; i < totalImgs; i++) {
+                const prepPct = 20 + ((i + 1) / totalImgs) * 15;
+                updateProgress(prepPct, `正在預先載入相片至記憶體 (${i + 1}/${totalImgs})...`);
+                const img = await loadImageObj(imageFiles[i]);
+                const imgBytes = await renderNormalizedImage(img, targetW, targetH);
+                await ffmpeg.writeFile(`slide_${i}.jpg`, imgBytes);
+            }
+
+            appendLog('所有相片已寫入虛擬系統，現在您可以放心鎖上螢幕或切換至其他 App！');
 
             const format = formatInput.value;
             const ext = format === 'mp4' ? 'mp4' : 'webm';
-            const totalImgs = imageFiles.length;
             let concatListText = '';
 
+            // 階段二：純 Worker 背景編碼迴圈 (完全不依賴 DOM 與 Canvas)
             for (let i = 0; i < totalImgs; i++) {
-                const stepBaseProgress = 25 + (i / totalImgs) * 65;
-                updateProgress(stepBaseProgress, `正在處理並編碼第 ${i + 1} / ${totalImgs} 張相片 (${imageFiles[i].name})...`);
-
-                const img = await loadImageObj(imageFiles[i]);
-                const imgBytes = await renderNormalizedImage(img, targetW, targetH);
+                const encodePct = 35 + (i / totalImgs) * 55;
+                updateProgress(encodePct, `背景編碼中: 第 ${i + 1} / ${totalImgs} 張相片...`);
 
                 const inputName = `slide_${i}.jpg`;
                 const segName = `seg_${i}.${ext}`;
-                await ffmpeg.writeFile(inputName, imgBytes);
-
                 const fadeOutStart = (duration - fadeTime).toFixed(2);
                 const vfFilter = `fade=t=in:st=0:d=${fadeTime},fade=t=out:st=${fadeOutStart}:d=${fadeTime},format=yuv420p`;
 
@@ -525,10 +605,10 @@
 
                 await ffmpeg.exec(ffmpegArgs);
                 await ffmpeg.deleteFile(inputName);
-
                 concatListText += `file '${segName}'\n`;
             }
 
+            // 階段三：無損合併
             updateProgress(92, '正在無損合併所有影片片段...');
             await ffmpeg.writeFile('list.txt', concatListText);
 
@@ -559,7 +639,7 @@
             downloadLink.download = `slideshow_${targetW}x${targetH}.${ext}`;
             downloadLink.textContent = `下載高畫質影片 (${ext.toUpperCase()} - ${targetW}x${targetH})`;
 
-            updateProgress(100, '完成！');
+            updateProgress(100, '影片合成完成！');
             resultContainer.style.display = 'block';
 
         } catch (err) {
@@ -567,6 +647,7 @@
             appendLog('\n[錯誤] ' + err.message);
             alert('生成過程中發生錯誤：' + err.message);
         } finally {
+            await disableBackgroundExecution();
             startBtn.disabled = false;
         }
     });
