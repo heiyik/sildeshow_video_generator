@@ -122,7 +122,7 @@
             font-size: 12px;
             padding: 10px;
             border-radius: 6px;
-            height: 140px;
+            height: 160px;
             overflow-y: auto;
             white-space: pre-wrap;
         }
@@ -246,6 +246,21 @@
 
     const heicConvertedCache = new Map();
 
+    // 格式化任何型別的例外物件，避免出現 undefined
+    function formatError(err) {
+        if (err === undefined) return '未知例外 (收到 undefined，可能為 WASM 記憶體不足或 Worker 中斷)';
+        if (err === null) return '未知例外 (收到 null)';
+        if (typeof err === 'string') return err;
+        if (err instanceof Error) {
+            return err.message ? `${err.message}${err.stack ? '\n' + err.stack : ''}` : String(err);
+        }
+        try {
+            return JSON.stringify(err);
+        } catch (_) {
+            return String(err);
+        }
+    }
+
     // === 背景續命與防休眠模組 (Wake Lock + Web Audio Keep-Alive) ===
     let wakeLock = null;
     let keepAliveAudio = null;
@@ -348,7 +363,6 @@
         );
     }
 
-    // 透過讀取檔案開頭 bytes 判斷是否為真正的 HEIC / HEIF 容器
     async function isRealHeicFile(file) {
         const lowerName = (file.name || '').toLowerCase();
         const lowerType = (file.type || '').toLowerCase();
@@ -380,7 +394,6 @@
         }
     }
 
-    // 將 HEIC/HEIF 轉換為保留完整原始解像度的 PNG Blob
     async function tryConvertHeic(file) {
         const cacheKey = `${file.name}_${file.size}_${file.lastModified}`;
         if (heicConvertedCache.has(cacheKey)) {
@@ -402,7 +415,7 @@
             heicConvertedCache.set(cacheKey, resultBlob);
             return resultBlob;
         } catch (err) {
-            appendLog(`[警告] heic2any 無法解析 ${file.name} (${err.message || err})，嘗試原生圖片讀取...`);
+            appendLog(`[警告] heic2any 無法解析 ${file.name} (${formatError(err)})，嘗試原生圖片讀取...`);
             return null;
         }
     }
@@ -585,8 +598,21 @@
             prepCanvas.toBlob(async (blob) => {
                 const buf = await blob.arrayBuffer();
                 resolve(new Uint8Array(buf));
-            }, 'image/jpeg', 0.92);
+            }, 'image/jpeg', 0.85);
         });
+    }
+
+    async function execFFmpegWithRetry(args, retries = 1) {
+        try {
+            return await ffmpeg.exec(args);
+        } catch (err) {
+            if (retries > 0) {
+                appendLog(`[重試] FFmpeg 執行發生例外 (${formatError(err)})，稍候重試...`);
+                await new Promise(r => setTimeout(r, 150));
+                return await execFFmpegWithRetry(args, retries - 1);
+            }
+            throw err;
+        }
     }
 
     startBtn.addEventListener('click', async () => {
@@ -642,7 +668,6 @@
 
             appendLog(`最終輸出解像度設定為: ${targetW}x${targetH}`);
 
-            // 階段一：逐張串流載入、繪製並寫入 FFmpeg（避免大量相片同時佔滿記憶體）
             let validCount = 0;
             const totalInputFiles = imageFiles.length;
 
@@ -674,14 +699,13 @@
             const ext = format === 'mp4' ? 'mp4' : 'webm';
             let concatListText = '';
 
-            // 階段二：逐段編碼並即時刪除已用完的輸入檔
             for (let i = 0; i < validCount; i++) {
                 const encodePct = 40 + (i / validCount) * 50;
                 updateProgress(encodePct, `背景編碼中: 第 ${i + 1} / ${validCount} 張相片...`);
 
                 const inputName = `slide_${i}.jpg`;
                 const segName = `seg_${i}.${ext}`;
-                const fadeOutStart = (duration - fadeTime).toFixed(2);
+                const fadeOutStart = Math.max(0, duration - fadeTime).toFixed(2);
                 const vfFilter = `fade=t=in:st=0:d=${fadeTime},fade=t=out:st=${fadeOutStart}:d=${fadeTime},format=yuv420p`;
 
                 let ffmpegArgs = [];
@@ -694,7 +718,8 @@
                         '-vf', vfFilter,
                         '-c:v', 'libx264',
                         '-preset', 'ultrafast',
-                        '-crf', '20',
+                        '-crf', '22',
+                        '-movflags', '+faststart',
                         segName
                     ];
                 } else {
@@ -710,23 +735,26 @@
                     ];
                 }
 
-                await ffmpeg.exec(ffmpegArgs);
+                await execFFmpegWithRetry(ffmpegArgs, 1);
                 await ffmpeg.deleteFile(inputName);
                 concatListText += `file '${segName}'\n`;
+
+                if (i % 10 === 0) {
+                    await new Promise(r => setTimeout(r, 0));
+                }
             }
 
-            // 階段三：無損合併
             updateProgress(92, '正在無損合併所有影片片段...');
             await ffmpeg.writeFile('list.txt', concatListText);
 
             const outputFileName = `output.${ext}`;
-            await ffmpeg.exec([
+            await execFFmpegWithRetry([
                 '-f', 'concat',
                 '-safe', '0',
                 '-i', 'list.txt',
                 '-c', 'copy',
                 outputFileName
-            ]);
+            ], 1);
 
             updateProgress(98, '正在匯出最終影片檔案...');
             const data = await ffmpeg.readFile(outputFileName);
@@ -750,9 +778,10 @@
             resultContainer.style.display = 'block';
 
         } catch (err) {
-            console.error(err);
-            appendLog('\n[錯誤] ' + err.message);
-            alert('生成過程中發生錯誤：' + err.message);
+            const errMsg = formatError(err);
+            console.error('Slideshow generation error:', err);
+            appendLog('\n[錯誤] ' + errMsg);
+            alert('生成過程中發生錯誤：' + errMsg);
         } finally {
             await disableBackgroundExecution();
             startBtn.disabled = false;
