@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FFmpeg.wasm 相片 Slideshow 產生器 (支援 HEIC & 手機背景執行)</title>
+    <title>FFmpeg.wasm 相片 Slideshow 影片產生器 (支援 HEIC & 手機背景執行)</title>
 
     <!-- 全域攔截跨網域 Worker，自動轉為同源 Blob Worker -->
     <script>
@@ -178,8 +178,8 @@
         <div>
             <label>3. 輸出解像度 (16:9 自動補黑邊):</label>
             <select id="resInput">
-                <option value="auto" selected>動態最高解像度 (自動偵測最大相片)</option>
-                <option value="1920x1080">1080p Full HD (1920x1080)</option>
+                <option value="1920x1080" selected>1080p Full HD (1920x1080 - 大量相片推薦)</option>
+                <option value="auto">動態最高解像度 (自動偵測最大相片)</option>
                 <option value="1280x720">720p HD (1280x720 - 手機推薦)</option>
                 <option value="3840x2160">4K Ultra HD (3840x2160)</option>
             </select>
@@ -244,7 +244,6 @@
     let imageFiles = [];
     let ffmpeg = null;
 
-    // 快取已轉換的 HEIC Blob，避免重複解碼浪費時間
     const heicConvertedCache = new Map();
 
     // === 背景續命與防休眠模組 (Wake Lock + Web Audio Keep-Alive) ===
@@ -340,52 +339,106 @@
         }
     }
 
-    // 判斷是否為 HEIC / HEIF 檔案
-    function isHeicFile(file) {
+    function isSupportedImageFile(file) {
         const lowerName = (file.name || '').toLowerCase();
-        const lowerType = (file.type || '').toLowerCase();
         return (
+            (file.type && file.type.startsWith('image/')) ||
             lowerName.endsWith('.heic') ||
-            lowerName.endsWith('.heif') ||
-            lowerType === 'image/heic' ||
-            lowerType === 'image/heif'
+            lowerName.endsWith('.heif')
         );
     }
 
-    // 判斷是否為支援的圖片檔
-    function isSupportedImageFile(file) {
-        return (file.type && file.type.startsWith('image/')) || isHeicFile(file);
+    // 透過讀取檔案開頭 bytes 判斷是否為真正的 HEIC / HEIF 容器
+    async function isRealHeicFile(file) {
+        const lowerName = (file.name || '').toLowerCase();
+        const lowerType = (file.type || '').toLowerCase();
+        const looksLikeHeic =
+            lowerName.endsWith('.heic') ||
+            lowerName.endsWith('.heif') ||
+            lowerType === 'image/heic' ||
+            lowerType === 'image/heif';
+
+        if (!looksLikeHeic) return false;
+
+        try {
+            const headerSlice = file.slice(0, 16);
+            const buf = await headerSlice.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+
+            if (bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) return false;
+            if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) return false;
+
+            const ftyp = String.fromCharCode(bytes[4] || 0, bytes[5] || 0, bytes[6] || 0, bytes[7] || 0);
+            if (ftyp === 'ftyp') {
+                const brand = String.fromCharCode(bytes[8] || 0, bytes[9] || 0, bytes[10] || 0, bytes[11] || 0).toLowerCase();
+                return ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand);
+            }
+
+            return true;
+        } catch (_) {
+            return true;
+        }
     }
 
-    // 將 HEIC/HEIF 轉換為無損 PNG Blob（保留完整原始像素解像度）
-    async function convertHeicToFullResBlob(file) {
+    // 將 HEIC/HEIF 轉換為保留完整原始解像度的 PNG Blob
+    async function tryConvertHeic(file) {
         const cacheKey = `${file.name}_${file.size}_${file.lastModified}`;
         if (heicConvertedCache.has(cacheKey)) {
             return heicConvertedCache.get(cacheKey);
         }
 
         if (typeof heic2any === 'undefined') {
-            throw new Error('heic2any 函式庫尚未載入，請檢查網路連線。');
+            return null;
         }
 
-        appendLog(`[HEIC 轉換] 正在解碼 ${file.name} (保留原始解像度)...`);
-        const converted = await heic2any({
-            blob: file,
-            toType: 'image/png',
-            quality: 1
-        });
-
-        const resultBlob = Array.isArray(converted) ? converted[0] : converted;
-        heicConvertedCache.set(cacheKey, resultBlob);
-        return resultBlob;
+        try {
+            appendLog(`[HEIC 轉換] 正在解碼 ${file.name} (保留原始解像度)...`);
+            const converted = await heic2any({
+                blob: file,
+                toType: 'image/png',
+                quality: 1
+            });
+            const resultBlob = Array.isArray(converted) ? converted[0] : converted;
+            heicConvertedCache.set(cacheKey, resultBlob);
+            return resultBlob;
+        } catch (err) {
+            appendLog(`[警告] heic2any 無法解析 ${file.name} (${err.message || err})，嘗試原生圖片讀取...`);
+            return null;
+        }
     }
 
-    // 取得可供 <img> 讀取的 Blob（若是 HEIC 則先轉碼）
-    async function getDrawableImageBlob(file) {
-        if (isHeicFile(file)) {
-            return await convertHeicToFullResBlob(file);
+    function loadBlobToImage(blob) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            const url = URL.createObjectURL(blob);
+            img.onload = () => {
+                URL.revokeObjectURL(url);
+                resolve(img);
+            };
+            img.onerror = () => {
+                URL.revokeObjectURL(url);
+                reject(new Error('Image element decode failed'));
+            };
+            img.src = url;
+        });
+    }
+
+    async function loadImageObj(file) {
+        if (await isRealHeicFile(file)) {
+            const convertedBlob = await tryConvertHeic(file);
+            if (convertedBlob) {
+                try {
+                    return await loadBlobToImage(convertedBlob);
+                } catch (_) {}
+            }
         }
-        return file;
+
+        try {
+            return await loadBlobToImage(file);
+        } catch (_) {
+            appendLog(`[跳過] 無法解碼檔案 ${file.name}（可能已損壞或非有效圖片）。`);
+            return null;
+        }
     }
 
     function handleFileSelect(e) {
@@ -393,9 +446,7 @@
         if (files.length > 0) {
             imageFiles = files;
             imageFiles.sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'}));
-            const heicCount = imageFiles.filter(isHeicFile).length;
-            const heicNote = heicCount > 0 ? `，含 ${heicCount} 張 HEIC` : '';
-            startBtn.textContent = `開始生成影片 (已排序 ${imageFiles.length} 張相片${heicNote})`;
+            startBtn.textContent = `開始生成影片 (已排序 ${imageFiles.length} 張相片)`;
         }
     }
 
@@ -503,24 +554,6 @@
         appendLog('FFmpeg 核心啟動成功！');
     }
 
-    // 載入圖片物件（自動處理 HEIC 並保留原始 naturalWidth / naturalHeight）
-    async function loadImageObj(file) {
-        const drawableBlob = await getDrawableImageBlob(file);
-        return new Promise((resolve, reject) => {
-            const img = new Image();
-            const url = URL.createObjectURL(drawableBlob);
-            img.onload = () => {
-                URL.revokeObjectURL(url);
-                resolve(img);
-            };
-            img.onerror = (err) => {
-                URL.revokeObjectURL(url);
-                reject(new Error(`無法讀取相片 ${file.name}`));
-            };
-            img.src = url;
-        });
-    }
-
     function renderNormalizedImage(img, targetW, targetH) {
         prepCanvas.width = targetW;
         prepCanvas.height = targetH;
@@ -552,7 +585,7 @@
             prepCanvas.toBlob(async (blob) => {
                 const buf = await blob.arrayBuffer();
                 resolve(new Uint8Array(buf));
-            }, 'image/png');
+            }, 'image/jpeg', 0.92);
         });
     }
 
@@ -580,25 +613,22 @@
         try {
             await initFFmpeg();
 
-            // 預先載入所有相片（包含 HEIC 轉碼），同時取得各自的完整原始解像度
-            const totalImgs = imageFiles.length;
-            const preparedImgs = [];
-
-            for (let i = 0; i < totalImgs; i++) {
-                const loadPct = 18 + ((i + 1) / totalImgs) * 8;
-                updateProgress(loadPct, `正在解析相片 (${i + 1}/${totalImgs}): ${imageFiles[i].name}...`);
-                const img = await loadImageObj(imageFiles[i]);
-                appendLog(`[解像度] ${imageFiles[i].name}: ${img.naturalWidth}x${img.naturalHeight}`);
-                preparedImgs.push(img);
-            }
-
             let targetW = 1920;
             let targetH = 1080;
 
             if (resInput.value === 'auto') {
+                updateProgress(18, '正在掃描相片最高解像度...');
                 let maxW = 1280;
-                for (const img of preparedImgs) {
-                    if (img.naturalWidth > maxW) maxW = img.naturalWidth;
+                for (let i = 0; i < imageFiles.length; i++) {
+                    const img = await loadImageObj(imageFiles[i]);
+                    if (img) {
+                        if (img.naturalWidth > maxW) maxW = img.naturalWidth;
+                        img.src = '';
+                    }
+                    if (i % 10 === 0) {
+                        updateProgress(18 + (i / imageFiles.length) * 4, `掃描解像度中 (${i + 1}/${imageFiles.length})...`);
+                        await new Promise(r => setTimeout(r, 0));
+                    }
                 }
                 targetW = Math.min(3840, maxW);
                 targetH = Math.round((targetW * 9) / 16);
@@ -612,29 +642,44 @@
 
             appendLog(`最終輸出解像度設定為: ${targetW}x${targetH}`);
 
-            // 階段一：將所有相片預處理並寫入 FFmpeg 虛擬系統
-            for (let i = 0; i < totalImgs; i++) {
-                const prepPct = 26 + ((i + 1) / totalImgs) * 14;
-                updateProgress(prepPct, `正在寫入記憶體 (${i + 1}/${totalImgs})...`);
-                const imgBytes = await renderNormalizedImage(preparedImgs[i], targetW, targetH);
-                await ffmpeg.writeFile(`slide_${i}.png`, imgBytes);
+            // 階段一：逐張串流載入、繪製並寫入 FFmpeg（避免大量相片同時佔滿記憶體）
+            let validCount = 0;
+            const totalInputFiles = imageFiles.length;
+
+            for (let i = 0; i < totalInputFiles; i++) {
+                const prepPct = 22 + ((i + 1) / totalInputFiles) * 18;
+                updateProgress(prepPct, `正在寫入記憶體 (${i + 1}/${totalInputFiles}): ${imageFiles[i].name}...`);
+
+                const img = await loadImageObj(imageFiles[i]);
+                if (!img) continue;
+
+                const imgBytes = await renderNormalizedImage(img, targetW, targetH);
+                await ffmpeg.writeFile(`slide_${validCount}.jpg`, imgBytes);
+
+                img.src = '';
+                validCount++;
+
+                if (i % 5 === 0) {
+                    await new Promise(r => setTimeout(r, 0));
+                }
             }
 
-            // 釋放瀏覽器端暫存的 Image 物件引用
-            preparedImgs.length = 0;
+            if (validCount === 0) {
+                throw new Error('沒有任何可成功解碼的有效相片，請檢查檔案是否損壞。');
+            }
 
-            appendLog('所有相片已寫入虛擬系統，現在您可以放心鎖上螢幕或切換至其他 App！');
+            appendLog(`已成功寫入 ${validCount} 張相片至虛擬系統，開始背景編碼...`);
 
             const format = formatInput.value;
             const ext = format === 'mp4' ? 'mp4' : 'webm';
             let concatListText = '';
 
-            // 階段二：純 Worker 背景編碼迴圈
-            for (let i = 0; i < totalImgs; i++) {
-                const encodePct = 40 + (i / totalImgs) * 50;
-                updateProgress(encodePct, `背景編碼中: 第 ${i + 1} / ${totalImgs} 張相片...`);
+            // 階段二：逐段編碼並即時刪除已用完的輸入檔
+            for (let i = 0; i < validCount; i++) {
+                const encodePct = 40 + (i / validCount) * 50;
+                updateProgress(encodePct, `背景編碼中: 第 ${i + 1} / ${validCount} 張相片...`);
 
-                const inputName = `slide_${i}.png`;
+                const inputName = `slide_${i}.jpg`;
                 const segName = `seg_${i}.${ext}`;
                 const fadeOutStart = (duration - fadeTime).toFixed(2);
                 const vfFilter = `fade=t=in:st=0:d=${fadeTime},fade=t=out:st=${fadeOutStart}:d=${fadeTime},format=yuv420p`;
@@ -686,7 +731,7 @@
             updateProgress(98, '正在匯出最終影片檔案...');
             const data = await ffmpeg.readFile(outputFileName);
 
-            for (let i = 0; i < totalImgs; i++) {
+            for (let i = 0; i < validCount; i++) {
                 await ffmpeg.deleteFile(`seg_${i}.${ext}`);
             }
             await ffmpeg.deleteFile('list.txt');
