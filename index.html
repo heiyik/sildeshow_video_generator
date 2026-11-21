@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FFmpeg.wasm 相片 Slideshow 產生器 (支援手機背景執行)</title>
-    
+    <title>FFmpeg.wasm 相片 Slideshow 產生器 (支援 HEIC & 手機背景執行)</title>
+
     <!-- 全域攔截跨網域 Worker，自動轉為同源 Blob Worker -->
     <script>
         const OriginalWorker = window.Worker;
@@ -19,6 +19,8 @@
         };
     </script>
 
+    <!-- 支援 Client-side .heic / .heif 解碼 -->
+    <script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
     <style>
         body {
@@ -152,16 +154,16 @@
 <body>
 
 <div class="container">
-    <h1>相片 Slideshow 產生器 <span class="badge">支援手機鎖屏背景執行</span></h1>
+    <h1>相片 Slideshow 產生器 <span class="badge">支援 HEIC & 手機背景執行</span></h1>
     
     <div class="form-group grid-2">
         <div>
             <label>1. 上傳相片資料夾 (Folder):</label>
-            <input type="file" id="folderInput" webkitdirectory directory multiple accept="image/*">
+            <input type="file" id="folderInput" webkitdirectory directory multiple accept="image/*,.heic,.heif">
         </div>
         <div>
-            <label>或 選擇多張相片 (手機建議用此項):</label>
-            <input type="file" id="filesInput" multiple accept="image/*">
+            <label>或 選擇多張相片 (支援 JPG / PNG / WebP / HEIC):</label>
+            <input type="file" id="filesInput" multiple accept="image/*,.heic,.heif">
         </div>
     </div>
 
@@ -176,10 +178,10 @@
         <div>
             <label>3. 輸出解像度 (16:9 自動補黑邊):</label>
             <select id="resInput">
+                <option value="auto" selected>動態最高解像度 (自動偵測最大相片)</option>
                 <option value="1920x1080">1080p Full HD (1920x1080)</option>
                 <option value="1280x720">720p HD (1280x720 - 手機推薦)</option>
                 <option value="3840x2160">4K Ultra HD (3840x2160)</option>
-                <option value="auto">動態最高解像度 (自動偵測最大相片)</option>
             </select>
         </div>
     </div>
@@ -242,12 +244,13 @@
     let imageFiles = [];
     let ffmpeg = null;
 
+    // 快取已轉換的 HEIC Blob，避免重複解碼浪費時間
+    const heicConvertedCache = new Map();
+
     // === 背景續命與防休眠模組 (Wake Lock + Web Audio Keep-Alive) ===
     let wakeLock = null;
     let keepAliveAudio = null;
-    let audioCtx = null;
 
-    // 產生一段 1 秒鐘極低音量的 WAV 音訊 Blob，欺騙手機系統目前正在播放媒體
     function createNearSilentWavBlob() {
         const sampleRate = 8000;
         const numSamples = sampleRate * 1;
@@ -269,7 +272,6 @@
         view.setUint16(34, 16, true);
         writeString(36, 'data');
         view.setUint32(40, numSamples * 2, true);
-        // 填入極微弱的振幅 (1)，避免被 iOS/Android 判定為純靜音(0)而切斷背景權限
         for (let i = 0; i < numSamples; i++) {
             view.setInt16(44 + i * 2, (i % 2 === 0) ? 1 : -1, true);
         }
@@ -277,7 +279,6 @@
     }
 
     async function enableBackgroundExecution() {
-        // 1. 啟動螢幕常亮鎖 (防止手機自動黑屏)
         if ('wakeLock' in navigator) {
             try {
                 wakeLock = await navigator.wakeLock.request('screen');
@@ -285,7 +286,6 @@
             } catch (e) {}
         }
 
-        // 2. 啟動無聲音樂播放器 (確保使用者手動鎖屏或切換 App 時，CPU 仍全速運作)
         try {
             if (!keepAliveAudio) {
                 keepAliveAudio = new Audio(URL.createObjectURL(createNearSilentWavBlob()));
@@ -294,7 +294,6 @@
             }
             await keepAliveAudio.play();
 
-            // 註冊手機鎖屏通知列狀態，提升系統背景優先權
             if ('mediaSession' in navigator) {
                 navigator.mediaSession.metadata = new MediaMetadata({
                     title: '正在背景合成 Slideshow 影片...',
@@ -335,19 +334,68 @@
         progressText.textContent = p + '%';
         if (status) {
             statusText.textContent = status;
-            // 同步更新手機鎖屏畫面上的進度標題
             if ('mediaSession' in navigator && navigator.mediaSession.metadata) {
                 navigator.mediaSession.metadata.title = `[${p}%] ${status}`;
             }
         }
     }
 
+    // 判斷是否為 HEIC / HEIF 檔案
+    function isHeicFile(file) {
+        const lowerName = (file.name || '').toLowerCase();
+        const lowerType = (file.type || '').toLowerCase();
+        return (
+            lowerName.endsWith('.heic') ||
+            lowerName.endsWith('.heif') ||
+            lowerType === 'image/heic' ||
+            lowerType === 'image/heif'
+        );
+    }
+
+    // 判斷是否為支援的圖片檔
+    function isSupportedImageFile(file) {
+        return (file.type && file.type.startsWith('image/')) || isHeicFile(file);
+    }
+
+    // 將 HEIC/HEIF 轉換為無損 PNG Blob（保留完整原始像素解像度）
+    async function convertHeicToFullResBlob(file) {
+        const cacheKey = `${file.name}_${file.size}_${file.lastModified}`;
+        if (heicConvertedCache.has(cacheKey)) {
+            return heicConvertedCache.get(cacheKey);
+        }
+
+        if (typeof heic2any === 'undefined') {
+            throw new Error('heic2any 函式庫尚未載入，請檢查網路連線。');
+        }
+
+        appendLog(`[HEIC 轉換] 正在解碼 ${file.name} (保留原始解像度)...`);
+        const converted = await heic2any({
+            blob: file,
+            toType: 'image/png',
+            quality: 1
+        });
+
+        const resultBlob = Array.isArray(converted) ? converted[0] : converted;
+        heicConvertedCache.set(cacheKey, resultBlob);
+        return resultBlob;
+    }
+
+    // 取得可供 <img> 讀取的 Blob（若是 HEIC 則先轉碼）
+    async function getDrawableImageBlob(file) {
+        if (isHeicFile(file)) {
+            return await convertHeicToFullResBlob(file);
+        }
+        return file;
+    }
+
     function handleFileSelect(e) {
-        const files = Array.from(e.target.files).filter(file => file.type.startsWith('image/'));
+        const files = Array.from(e.target.files).filter(isSupportedImageFile);
         if (files.length > 0) {
             imageFiles = files;
             imageFiles.sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'}));
-            startBtn.textContent = `開始生成影片 (已排序 ${imageFiles.length} 張相片)`;
+            const heicCount = imageFiles.filter(isHeicFile).length;
+            const heicNote = heicCount > 0 ? `，含 ${heicCount} 張 HEIC` : '';
+            startBtn.textContent = `開始生成影片 (已排序 ${imageFiles.length} 張相片${heicNote})`;
         }
     }
 
@@ -455,15 +503,20 @@
         appendLog('FFmpeg 核心啟動成功！');
     }
 
-    function loadImageObj(file) {
+    // 載入圖片物件（自動處理 HEIC 並保留原始 naturalWidth / naturalHeight）
+    async function loadImageObj(file) {
+        const drawableBlob = await getDrawableImageBlob(file);
         return new Promise((resolve, reject) => {
             const img = new Image();
-            const url = URL.createObjectURL(file);
+            const url = URL.createObjectURL(drawableBlob);
             img.onload = () => {
                 URL.revokeObjectURL(url);
                 resolve(img);
             };
-            img.onerror = reject;
+            img.onerror = (err) => {
+                URL.revokeObjectURL(url);
+                reject(new Error(`無法讀取相片 ${file.name}`));
+            };
             img.src = url;
         });
     }
@@ -499,7 +552,7 @@
             prepCanvas.toBlob(async (blob) => {
                 const buf = await blob.arrayBuffer();
                 resolve(new Uint8Array(buf));
-            }, 'image/jpeg', 0.95);
+            }, 'image/png');
         });
     }
 
@@ -522,22 +575,30 @@
         progressContainer.style.display = 'block';
         logBox.textContent = '';
 
-        // 必須在使用者點擊按鈕的當下立刻啟動背景音訊與防休眠鎖
         await enableBackgroundExecution();
 
         try {
             await initFFmpeg();
 
+            // 預先載入所有相片（包含 HEIC 轉碼），同時取得各自的完整原始解像度
+            const totalImgs = imageFiles.length;
+            const preparedImgs = [];
+
+            for (let i = 0; i < totalImgs; i++) {
+                const loadPct = 18 + ((i + 1) / totalImgs) * 8;
+                updateProgress(loadPct, `正在解析相片 (${i + 1}/${totalImgs}): ${imageFiles[i].name}...`);
+                const img = await loadImageObj(imageFiles[i]);
+                appendLog(`[解像度] ${imageFiles[i].name}: ${img.naturalWidth}x${img.naturalHeight}`);
+                preparedImgs.push(img);
+            }
+
             let targetW = 1920;
             let targetH = 1080;
 
             if (resInput.value === 'auto') {
-                updateProgress(18, '正在掃描相片最高解像度...');
-                let maxW = 1280, maxH = 720;
-                for (const file of imageFiles) {
-                    const img = await loadImageObj(file);
+                let maxW = 1280;
+                for (const img of preparedImgs) {
                     if (img.naturalWidth > maxW) maxW = img.naturalWidth;
-                    if (img.naturalHeight > maxH) maxH = img.naturalHeight;
                 }
                 targetW = Math.min(3840, maxW);
                 targetH = Math.round((targetW * 9) / 16);
@@ -549,17 +610,18 @@
             targetW = targetW % 2 === 0 ? targetW : targetW - 1;
             targetH = targetH % 2 === 0 ? targetH : targetH - 1;
 
-            const totalImgs = imageFiles.length;
+            appendLog(`最終輸出解像度設定為: ${targetW}x${targetH}`);
 
-            // 階段一：趁使用者還在畫面上，優先將所有相片預處理並寫入 FFmpeg 記憶體
-            // 這樣接下來就算鎖屏導致 DOM Canvas 被凍結，FFmpeg Worker 也能獨立在背景跑完！
+            // 階段一：將所有相片預處理並寫入 FFmpeg 虛擬系統
             for (let i = 0; i < totalImgs; i++) {
-                const prepPct = 20 + ((i + 1) / totalImgs) * 15;
-                updateProgress(prepPct, `正在預先載入相片至記憶體 (${i + 1}/${totalImgs})...`);
-                const img = await loadImageObj(imageFiles[i]);
-                const imgBytes = await renderNormalizedImage(img, targetW, targetH);
-                await ffmpeg.writeFile(`slide_${i}.jpg`, imgBytes);
+                const prepPct = 26 + ((i + 1) / totalImgs) * 14;
+                updateProgress(prepPct, `正在寫入記憶體 (${i + 1}/${totalImgs})...`);
+                const imgBytes = await renderNormalizedImage(preparedImgs[i], targetW, targetH);
+                await ffmpeg.writeFile(`slide_${i}.png`, imgBytes);
             }
+
+            // 釋放瀏覽器端暫存的 Image 物件引用
+            preparedImgs.length = 0;
 
             appendLog('所有相片已寫入虛擬系統，現在您可以放心鎖上螢幕或切換至其他 App！');
 
@@ -567,12 +629,12 @@
             const ext = format === 'mp4' ? 'mp4' : 'webm';
             let concatListText = '';
 
-            // 階段二：純 Worker 背景編碼迴圈 (完全不依賴 DOM 與 Canvas)
+            // 階段二：純 Worker 背景編碼迴圈
             for (let i = 0; i < totalImgs; i++) {
-                const encodePct = 35 + (i / totalImgs) * 55;
+                const encodePct = 40 + (i / totalImgs) * 50;
                 updateProgress(encodePct, `背景編碼中: 第 ${i + 1} / ${totalImgs} 張相片...`);
 
-                const inputName = `slide_${i}.jpg`;
+                const inputName = `slide_${i}.png`;
                 const segName = `seg_${i}.${ext}`;
                 const fadeOutStart = (duration - fadeTime).toFixed(2);
                 const vfFilter = `fade=t=in:st=0:d=${fadeTime},fade=t=out:st=${fadeOutStart}:d=${fadeTime},format=yuv420p`;
