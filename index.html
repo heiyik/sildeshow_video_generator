@@ -245,8 +245,8 @@
     let ffmpeg = null;
 
     const heicConvertedCache = new Map();
+    const BATCH_SIZE = 25; // 每 25 張合併一次並清理分段，避免 WASM 記憶體累積爆滿
 
-    // 格式化任何型別的例外物件，避免出現 undefined
     function formatError(err) {
         if (err === undefined) return '未知例外 (收到 undefined，可能為 WASM 記憶體不足或 Worker 中斷)';
         if (err === null) return '未知例外 (收到 null)';
@@ -615,6 +615,26 @@
         }
     }
 
+    // 將一組分段檔合併成單一批次檔，並立即刪除該組分段檔釋放記憶體
+    async function mergeSegmentsToBatch(segNames, batchFileName) {
+        const listFileName = `${batchFileName}_list.txt`;
+        const listContent = segNames.map(name => `file '${name}'`).join('\n') + '\n';
+        await ffmpeg.writeFile(listFileName, listContent);
+
+        await execFFmpegWithRetry([
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', listFileName,
+            '-c', 'copy',
+            batchFileName
+        ], 1);
+
+        await ffmpeg.deleteFile(listFileName);
+        for (const seg of segNames) {
+            await ffmpeg.deleteFile(seg);
+        }
+    }
+
     startBtn.addEventListener('click', async () => {
         if (imageFiles.length === 0) {
             alert('請先上傳相片資料夾或選擇多張相片！');
@@ -693,11 +713,15 @@
                 throw new Error('沒有任何可成功解碼的有效相片，請檢查檔案是否損壞。');
             }
 
-            appendLog(`已成功寫入 ${validCount} 張相片至虛擬系統，開始背景編碼...`);
+            appendLog(`已成功寫入 ${validCount} 張相片，每 ${BATCH_SIZE} 張分批合成以釋放記憶體...`);
 
             const format = formatInput.value;
             const ext = format === 'mp4' ? 'mp4' : 'webm';
-            let concatListText = '';
+            const fadeOutStart = Math.max(0, duration - fadeTime).toFixed(2);
+            const vfFilter = `fade=t=in:st=0:d=${fadeTime},fade=t=out:st=${fadeOutStart}:d=${fadeTime},format=yuv420p`;
+
+            let currentBatchSegs = [];
+            const batchFiles = [];
 
             for (let i = 0; i < validCount; i++) {
                 const encodePct = 40 + (i / validCount) * 50;
@@ -705,8 +729,6 @@
 
                 const inputName = `slide_${i}.jpg`;
                 const segName = `seg_${i}.${ext}`;
-                const fadeOutStart = Math.max(0, duration - fadeTime).toFixed(2);
-                const vfFilter = `fade=t=in:st=0:d=${fadeTime},fade=t=out:st=${fadeOutStart}:d=${fadeTime},format=yuv420p`;
 
                 let ffmpegArgs = [];
                 if (format === 'mp4') {
@@ -737,32 +759,51 @@
 
                 await execFFmpegWithRetry(ffmpegArgs, 1);
                 await ffmpeg.deleteFile(inputName);
-                concatListText += `file '${segName}'\n`;
+                currentBatchSegs.push(segName);
 
-                if (i % 10 === 0) {
+                // 每滿 BATCH_SIZE 張，或到達最後一張時，立即合併成批次檔並清除分段
+                const isBatchFull = currentBatchSegs.length >= BATCH_SIZE;
+                const isLastItem = (i === validCount - 1);
+
+                if (isBatchFull || isLastItem) {
+                    const batchName = `batch_${batchFiles.length}.${ext}`;
+                    appendLog(`[分批合併] 正在整理 ${currentBatchSegs.length} 個片段至 ${batchName} 並釋放記憶體...`);
+                    await mergeSegmentsToBatch(currentBatchSegs, batchName);
+                    batchFiles.push(batchName);
+                    currentBatchSegs = [];
+                }
+
+                if (i % 5 === 0) {
                     await new Promise(r => setTimeout(r, 0));
                 }
             }
 
-            updateProgress(92, '正在無損合併所有影片片段...');
-            await ffmpeg.writeFile('list.txt', concatListText);
-
+            // 最終將所有批次檔合併為完整影片
+            updateProgress(92, '正在合併所有批次影片...');
             const outputFileName = `output.${ext}`;
-            await execFFmpegWithRetry([
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', 'list.txt',
-                '-c', 'copy',
-                outputFileName
-            ], 1);
+
+            if (batchFiles.length === 1) {
+                const singleBatchData = await ffmpeg.readFile(batchFiles[0]);
+                await ffmpeg.writeFile(outputFileName, singleBatchData);
+                await ffmpeg.deleteFile(batchFiles[0]);
+            } else {
+                const finalListContent = batchFiles.map(name => `file '${name}'`).join('\n') + '\n';
+                await ffmpeg.writeFile('final_list.txt', finalListContent);
+                await execFFmpegWithRetry([
+                    '-f', 'concat',
+                    '-safe', '0',
+                    '-i', 'final_list.txt',
+                    '-c', 'copy',
+                    outputFileName
+                ], 1);
+                await ffmpeg.deleteFile('final_list.txt');
+                for (const bName of batchFiles) {
+                    await ffmpeg.deleteFile(bName);
+                }
+            }
 
             updateProgress(98, '正在匯出最終影片檔案...');
             const data = await ffmpeg.readFile(outputFileName);
-
-            for (let i = 0; i < validCount; i++) {
-                await ffmpeg.deleteFile(`seg_${i}.${ext}`);
-            }
-            await ffmpeg.deleteFile('list.txt');
             await ffmpeg.deleteFile(outputFileName);
 
             const mimeType = format === 'mp4' ? 'video/mp4' : 'video/webm';
