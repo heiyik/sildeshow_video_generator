@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FFmpeg.wasm 相片 Slideshow 影片產生器 (支援 HEIC & 手機背景執行)</title>
+    <title>FFmpeg.wasm 相片 Slideshow 產生器 (低記憶體防爆版)</title>
 
     <!-- 全域攔截跨網域 Worker，自動轉為同源 Blob Worker -->
     <script>
@@ -45,7 +45,7 @@
         }
         .badge {
             display: inline-block;
-            background: #8e44ad;
+            background: #27ae60;
             color: #fff;
             font-size: 12px;
             padding: 4px 10px;
@@ -154,7 +154,7 @@
 <body>
 
 <div class="container">
-    <h1>相片 Slideshow 產生器 <span class="badge">支援 HEIC & 手機背景執行</span></h1>
+    <h1>相片 Slideshow 產生器 <span class="badge">低記憶體防爆版 (每15張重啟釋放)</span></h1>
     
     <div class="form-group grid-2">
         <div>
@@ -178,9 +178,9 @@
         <div>
             <label>3. 輸出解像度 (16:9 自動補黑邊):</label>
             <select id="resInput">
-                <option value="1920x1080" selected>1080p Full HD (1920x1080 - 大量相片推薦)</option>
+                <option value="1920x1080" selected>1080p Full HD (1920x1080)</option>
+                <option value="1280x720">720p HD (1280x720 - 舊機最穩最快)</option>
                 <option value="auto">動態最高解像度 (自動偵測最大相片)</option>
-                <option value="1280x720">720p HD (1280x720 - 手機推薦)</option>
                 <option value="3840x2160">4K Ultra HD (3840x2160)</option>
             </select>
         </div>
@@ -243,12 +243,14 @@
 
     let imageFiles = [];
     let ffmpeg = null;
+    let cachedWasmBlobURL = null;
+    let cachedCoreBlobURL = null;
 
-    const heicConvertedCache = new Map();
-    const BATCH_SIZE = 25; // 每 25 張合併一次並清理分段，避免 WASM 記憶體累積爆滿
+    // 每處理 15 張相片就銷毀並重啟 FFmpeg Worker，徹底清空 2GB WASM 記憶體
+    const BATCH_SIZE = 15;
 
     function formatError(err) {
-        if (err === undefined) return '未知例外 (收到 undefined，可能為 WASM 記憶體不足或 Worker 中斷)';
+        if (err === undefined) return '未知例外 (收到 undefined，可能為記憶體不足或 Worker 中斷)';
         if (err === null) return '未知例外 (收到 null)';
         if (typeof err === 'string') return err;
         if (err instanceof Error) {
@@ -311,12 +313,12 @@
             if ('mediaSession' in navigator) {
                 navigator.mediaSession.metadata = new MediaMetadata({
                     title: '正在背景合成 Slideshow 影片...',
-                    artist: 'FFmpeg.wasm 背景引擎運作中',
+                    artist: 'FFmpeg.wasm 低記憶體引擎運作中',
                     album: '請勿關閉此瀏覽器分頁'
                 });
                 navigator.mediaSession.playbackState = 'playing';
             }
-            appendLog('[背景守護] 已啟動背景音訊續命模式，現在鎖上螢幕或切換 App 仍會繼續運算！');
+            appendLog('[背景守護] 已啟動背景音訊續命模式。');
         } catch (e) {
             console.warn('背景音訊啟動失敗:', e);
         }
@@ -339,6 +341,10 @@
 
     function appendLog(msg) {
         logBox.textContent += msg + '\n';
+        // 限制日誌長度，避免長時間執行導致 DOM 文字節點過大佔用記憶體
+        if (logBox.textContent.length > 25000) {
+            logBox.textContent = logBox.textContent.slice(-15000);
+        }
         logBox.scrollTop = logBox.scrollHeight;
     }
 
@@ -387,7 +393,6 @@
                 const brand = String.fromCharCode(bytes[8] || 0, bytes[9] || 0, bytes[10] || 0, bytes[11] || 0).toLowerCase();
                 return ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand);
             }
-
             return true;
         } catch (_) {
             return true;
@@ -395,27 +400,17 @@
     }
 
     async function tryConvertHeic(file) {
-        const cacheKey = `${file.name}_${file.size}_${file.lastModified}`;
-        if (heicConvertedCache.has(cacheKey)) {
-            return heicConvertedCache.get(cacheKey);
-        }
-
-        if (typeof heic2any === 'undefined') {
-            return null;
-        }
-
+        if (typeof heic2any === 'undefined') return null;
         try {
-            appendLog(`[HEIC 轉換] 正在解碼 ${file.name} (保留原始解像度)...`);
+            appendLog(`[HEIC 轉換] 正在解碼 ${file.name}...`);
             const converted = await heic2any({
                 blob: file,
-                toType: 'image/png',
-                quality: 1
+                toType: 'image/jpeg',
+                quality: 0.92
             });
-            const resultBlob = Array.isArray(converted) ? converted[0] : converted;
-            heicConvertedCache.set(cacheKey, resultBlob);
-            return resultBlob;
+            return Array.isArray(converted) ? converted[0] : converted;
         } catch (err) {
-            appendLog(`[警告] heic2any 無法解析 ${file.name} (${formatError(err)})，嘗試原生圖片讀取...`);
+            appendLog(`[警告] heic2any 無法解析 ${file.name}，嘗試原生圖片讀取...`);
             return null;
         }
     }
@@ -498,7 +493,7 @@
     async function fetchWithProgressAndCache(url, mimeType, label, startPct, endPct) {
         const cached = await getCachedBlob(url);
         if (cached) {
-            appendLog(`[IndexedDB] 已從本機快取秒速載入 ${label}！`);
+            appendLog(`[IndexedDB] 已從本機快取載入 ${label}！`);
             updateProgress(endPct, `已從快取載入 ${label}`);
             return URL.createObjectURL(new Blob([cached], { type: mimeType }));
         }
@@ -535,36 +530,55 @@
         return URL.createObjectURL(blob);
     }
 
-    async function initFFmpeg() {
-        if (ffmpeg && ffmpeg.loaded) return;
+    // 預先準備 WASM 與 Core JS 的 Blob URL（之後每次重啟 Worker 只需 0.5 秒）
+    async function ensureFFmpegAssets() {
+        const coreBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
+        if (!cachedWasmBlobURL) {
+            cachedWasmBlobURL = await fetchWithProgressAndCache(
+                `${coreBase}/ffmpeg-core.wasm`,
+                'application/wasm',
+                'FFmpeg WASM 引擎',
+                2, 14
+            );
+        }
+        if (!cachedCoreBlobURL) {
+            cachedCoreBlobURL = await fetchWithProgressAndCache(
+                `${coreBase}/ffmpeg-core.js`,
+                'text/javascript',
+                'FFmpeg Core JS',
+                14, 16
+            );
+        }
+    }
+
+    // 徹底銷毀舊 Worker 並啟動一個 100% 乾淨記憶體的新 FFmpeg 實例
+    async function startFreshFFmpeg() {
+        if (ffmpeg) {
+            try { ffmpeg.terminate(); } catch (_) {}
+            ffmpeg = null;
+        }
+        // 給瀏覽器一點時間回收舊 Worker 的記憶體
+        await new Promise(r => setTimeout(r, 100));
 
         ffmpeg = new FFmpeg();
         ffmpeg.on('log', ({ message }) => {
-            appendLog(message);
+            // 只顯示重要訊息，減少大量 frame log 拖慢舊機
+            if (message.includes('Error') || message.includes('error') || message.includes('Output #0')) {
+                appendLog(message);
+            }
         });
 
-        const coreBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
-
-        const wasmBlobURL = await fetchWithProgressAndCache(
-            `${coreBase}/ffmpeg-core.wasm`,
-            'application/wasm',
-            'FFmpeg WASM 引擎',
-            2, 14
-        );
-
-        const coreBlobURL = await fetchWithProgressAndCache(
-            `${coreBase}/ffmpeg-core.js`,
-            'text/javascript',
-            'FFmpeg Core JS',
-            14, 16
-        );
-
-        updateProgress(17, '正在啟動 WebAssembly 虛擬機器...');
         await ffmpeg.load({
-            coreURL: coreBlobURL,
-            wasmURL: wasmBlobURL
+            coreURL: cachedCoreBlobURL,
+            wasmURL: cachedWasmBlobURL
         });
-        appendLog('FFmpeg 核心啟動成功！');
+    }
+
+    function terminateFFmpeg() {
+        if (ffmpeg) {
+            try { ffmpeg.terminate(); } catch (_) {}
+            ffmpeg = null;
+        }
     }
 
     function renderNormalizedImage(img, targetW, targetH) {
@@ -602,39 +616,6 @@
         });
     }
 
-    async function execFFmpegWithRetry(args, retries = 1) {
-        try {
-            return await ffmpeg.exec(args);
-        } catch (err) {
-            if (retries > 0) {
-                appendLog(`[重試] FFmpeg 執行發生例外 (${formatError(err)})，稍候重試...`);
-                await new Promise(r => setTimeout(r, 150));
-                return await execFFmpegWithRetry(args, retries - 1);
-            }
-            throw err;
-        }
-    }
-
-    // 將一組分段檔合併成單一批次檔，並立即刪除該組分段檔釋放記憶體
-    async function mergeSegmentsToBatch(segNames, batchFileName) {
-        const listFileName = `${batchFileName}_list.txt`;
-        const listContent = segNames.map(name => `file '${name}'`).join('\n') + '\n';
-        await ffmpeg.writeFile(listFileName, listContent);
-
-        await execFFmpegWithRetry([
-            '-f', 'concat',
-            '-safe', '0',
-            '-i', listFileName,
-            '-c', 'copy',
-            batchFileName
-        ], 1);
-
-        await ffmpeg.deleteFile(listFileName);
-        for (const seg of segNames) {
-            await ffmpeg.deleteFile(seg);
-        }
-    }
-
     startBtn.addEventListener('click', async () => {
         if (imageFiles.length === 0) {
             alert('請先上傳相片資料夾或選擇多張相片！');
@@ -657,13 +638,14 @@
         await enableBackgroundExecution();
 
         try {
-            await initFFmpeg();
+            await ensureFFmpegAssets();
 
+            // 1. 決定目標解像度
             let targetW = 1920;
             let targetH = 1080;
 
             if (resInput.value === 'auto') {
-                updateProgress(18, '正在掃描相片最高解像度...');
+                updateProgress(17, '正在掃描相片最高解像度...');
                 let maxW = 1280;
                 for (let i = 0; i < imageFiles.length; i++) {
                     const img = await loadImageObj(imageFiles[i]);
@@ -672,7 +654,7 @@
                         img.src = '';
                     }
                     if (i % 10 === 0) {
-                        updateProgress(18 + (i / imageFiles.length) * 4, `掃描解像度中 (${i + 1}/${imageFiles.length})...`);
+                        updateProgress(17 + (i / imageFiles.length) * 3, `掃描解像度中 (${i + 1}/${imageFiles.length})...`);
                         await new Promise(r => setTimeout(r, 0));
                     }
                 }
@@ -686,136 +668,148 @@
             targetW = targetW % 2 === 0 ? targetW : targetW - 1;
             targetH = targetH % 2 === 0 ? targetH : targetH - 1;
 
-            appendLog(`最終輸出解像度設定為: ${targetW}x${targetH}`);
-
-            let validCount = 0;
-            const totalInputFiles = imageFiles.length;
-
-            for (let i = 0; i < totalInputFiles; i++) {
-                const prepPct = 22 + ((i + 1) / totalInputFiles) * 18;
-                updateProgress(prepPct, `正在寫入記憶體 (${i + 1}/${totalInputFiles}): ${imageFiles[i].name}...`);
-
-                const img = await loadImageObj(imageFiles[i]);
-                if (!img) continue;
-
-                const imgBytes = await renderNormalizedImage(img, targetW, targetH);
-                await ffmpeg.writeFile(`slide_${validCount}.jpg`, imgBytes);
-
-                img.src = '';
-                validCount++;
-
-                if (i % 5 === 0) {
-                    await new Promise(r => setTimeout(r, 0));
-                }
-            }
-
-            if (validCount === 0) {
-                throw new Error('沒有任何可成功解碼的有效相片，請檢查檔案是否損壞。');
-            }
-
-            appendLog(`已成功寫入 ${validCount} 張相片，每 ${BATCH_SIZE} 張分批合成以釋放記憶體...`);
-
             const format = formatInput.value;
             const ext = format === 'mp4' ? 'mp4' : 'webm';
+            const mimeType = format === 'mp4' ? 'video/mp4' : 'video/webm';
             const fadeOutStart = Math.max(0, duration - fadeTime).toFixed(2);
             const vfFilter = `fade=t=in:st=0:d=${fadeTime},fade=t=out:st=${fadeOutStart}:d=${fadeTime},format=yuv420p`;
 
-            let currentBatchSegs = [];
-            const batchFiles = [];
+            const totalFiles = imageFiles.length;
+            const totalBatches = Math.ceil(totalFiles / BATCH_SIZE);
+            const batchBlobs = []; // 存放在 WASM 外部的批次影片 Blob
 
-            for (let i = 0; i < validCount; i++) {
-                const encodePct = 40 + (i / validCount) * 50;
-                updateProgress(encodePct, `背景編碼中: 第 ${i + 1} / ${validCount} 張相片...`);
+            appendLog(`目標解像度: ${targetW}x${targetH}，共 ${totalFiles} 張相片，將分為 ${totalBatches} 批處理（每批 ${BATCH_SIZE} 張後重啟釋放記憶體）。`);
 
-                const inputName = `slide_${i}.jpg`;
-                const segName = `seg_${i}.${ext}`;
+            // 2. 分批處理迴圈：每批啟動全新 FFmpeg -> 編碼 -> 合併 -> 搬出 Blob -> 銷毀 FFmpeg
+            for (let b = 0; b < totalBatches; b++) {
+                const startIdx = b * BATCH_SIZE;
+                const endIdx = Math.min(startIdx + BATCH_SIZE, totalFiles);
 
-                let ffmpegArgs = [];
-                if (format === 'mp4') {
-                    ffmpegArgs = [
-                        '-loop', '1',
-                        '-framerate', '30',
-                        '-i', inputName,
-                        '-t', duration.toString(),
-                        '-vf', vfFilter,
-                        '-c:v', 'libx264',
-                        '-preset', 'ultrafast',
-                        '-crf', '22',
-                        '-movflags', '+faststart',
-                        segName
-                    ];
-                } else {
-                    ffmpegArgs = [
-                        '-loop', '1',
-                        '-framerate', '30',
-                        '-i', inputName,
-                        '-t', duration.toString(),
-                        '-vf', vfFilter,
-                        '-c:v', 'libvpx',
-                        '-b:v', '4M',
-                        segName
-                    ];
+                appendLog(`\n--- [第 ${b + 1}/${totalBatches} 批] 啟動全新 FFmpeg Worker (相片 ${startIdx + 1} ~ ${endIdx}) ---`);
+                await startFreshFFmpeg();
+
+                const segNames = [];
+
+                for (let i = startIdx; i < endIdx; i++) {
+                    const pct = 20 + (i / totalFiles) * 70;
+                    updateProgress(pct, `[第 ${b + 1}/${totalBatches} 批] 處理第 ${i + 1} / ${totalFiles} 張 (${imageFiles[i].name})...`);
+
+                    const img = await loadImageObj(imageFiles[i]);
+                    if (!img) continue;
+
+                    const imgBytes = await renderNormalizedImage(img, targetW, targetH);
+                    img.src = '';
+
+                    const inputName = `slide_${i}.jpg`;
+                    const segName = `seg_${i}.${ext}`;
+                    await ffmpeg.writeFile(inputName, imgBytes);
+
+                    let ffmpegArgs = [];
+                    if (format === 'mp4') {
+                        ffmpegArgs = [
+                            '-loop', '1',
+                            '-framerate', '30',
+                            '-i', inputName,
+                            '-t', duration.toString(),
+                            '-vf', vfFilter,
+                            '-c:v', 'libx264',
+                            '-preset', 'ultrafast',
+                            '-crf', '22',
+                            '-movflags', '+faststart',
+                            segName
+                        ];
+                    } else {
+                        ffmpegArgs = [
+                            '-loop', '1',
+                            '-framerate', '30',
+                            '-i', inputName,
+                            '-t', duration.toString(),
+                            '-vf', vfFilter,
+                            '-c:v', 'libvpx',
+                            '-b:v', '4M',
+                            segName
+                        ];
+                    }
+
+                    await ffmpeg.exec(ffmpegArgs);
+                    await ffmpeg.deleteFile(inputName);
+                    segNames.push(segName);
                 }
 
-                await execFFmpegWithRetry(ffmpegArgs, 1);
-                await ffmpeg.deleteFile(inputName);
-                currentBatchSegs.push(segName);
-
-                // 每滿 BATCH_SIZE 張，或到達最後一張時，立即合併成批次檔並清除分段
-                const isBatchFull = currentBatchSegs.length >= BATCH_SIZE;
-                const isLastItem = (i === validCount - 1);
-
-                if (isBatchFull || isLastItem) {
-                    const batchName = `batch_${batchFiles.length}.${ext}`;
-                    appendLog(`[分批合併] 正在整理 ${currentBatchSegs.length} 個片段至 ${batchName} 並釋放記憶體...`);
-                    await mergeSegmentsToBatch(currentBatchSegs, batchName);
-                    batchFiles.push(batchName);
-                    currentBatchSegs = [];
+                // 將本批次的片段無損合併，並搬出至外部 Blob
+                if (segNames.length > 0) {
+                    const batchOutName = `batch_${b}.${ext}`;
+                    if (segNames.length === 1) {
+                        const data = await ffmpeg.readFile(segNames[0]);
+                        batchBlobs.push(new Blob([data.buffer], { type: mimeType }));
+                    } else {
+                        const listContent = segNames.map(name => `file '${name}'`).join('\n') + '\n';
+                        await ffmpeg.writeFile('batch_list.txt', listContent);
+                        await ffmpeg.exec([
+                            '-f', 'concat',
+                            '-safe', '0',
+                            '-i', 'batch_list.txt',
+                            '-c', 'copy',
+                            batchOutName
+                        ]);
+                        const data = await ffmpeg.readFile(batchOutName);
+                        batchBlobs.push(new Blob([data.buffer], { type: mimeType }));
+                    }
+                    appendLog(`[第 ${b + 1}/${totalBatches} 批] 完成！已搬出至外部記憶體，正在銷毀 Worker 釋放 RAM...`);
                 }
 
-                if (i % 5 === 0) {
-                    await new Promise(r => setTimeout(r, 0));
-                }
+                // 強制終止 Worker，100% 釋放 2GB WASM 線性記憶體！
+                terminateFFmpeg();
             }
 
-            // 最終將所有批次檔合併為完整影片
-            updateProgress(92, '正在合併所有批次影片...');
-            const outputFileName = `output.${ext}`;
+            if (batchBlobs.length === 0) {
+                throw new Error('沒有任何可成功解碼的有效相片。');
+            }
 
-            if (batchFiles.length === 1) {
-                const singleBatchData = await ffmpeg.readFile(batchFiles[0]);
-                await ffmpeg.writeFile(outputFileName, singleBatchData);
-                await ffmpeg.deleteFile(batchFiles[0]);
+            // 3. 最終合併所有外部批次 Blob
+            let finalVideoBlob = null;
+
+            if (batchBlobs.length === 1) {
+                finalVideoBlob = batchBlobs[0];
             } else {
-                const finalListContent = batchFiles.map(name => `file '${name}'`).join('\n') + '\n';
+                updateProgress(92, `正在啟動乾淨 Worker 無損合併 ${batchBlobs.length} 個批次影片...`);
+                appendLog(`\n--- 最終無損合併 (${batchBlobs.length} 個批次檔) ---`);
+                await startFreshFFmpeg();
+
+                let finalListContent = '';
+                for (let b = 0; b < batchBlobs.length; b++) {
+                    const bName = `batch_${b}.${ext}`;
+                    const buf = await batchBlobs[b].arrayBuffer();
+                    await ffmpeg.writeFile(bName, new Uint8Array(buf));
+                    finalListContent += `file '${bName}'\n`;
+                }
+                // 釋放外部批次 Blob 陣列
+                batchBlobs.length = 0;
+
                 await ffmpeg.writeFile('final_list.txt', finalListContent);
-                await execFFmpegWithRetry([
+                const outputFileName = `output.${ext}`;
+                await ffmpeg.exec([
                     '-f', 'concat',
                     '-safe', '0',
                     '-i', 'final_list.txt',
                     '-c', 'copy',
                     outputFileName
-                ], 1);
-                await ffmpeg.deleteFile('final_list.txt');
-                for (const bName of batchFiles) {
-                    await ffmpeg.deleteFile(bName);
-                }
+                ]);
+
+                updateProgress(98, '正在匯出最終影片檔案...');
+                const finalData = await ffmpeg.readFile(outputFileName);
+                finalVideoBlob = new Blob([finalData.buffer], { type: mimeType });
+                terminateFFmpeg();
             }
 
-            updateProgress(98, '正在匯出最終影片檔案...');
-            const data = await ffmpeg.readFile(outputFileName);
-            await ffmpeg.deleteFile(outputFileName);
-
-            const mimeType = format === 'mp4' ? 'video/mp4' : 'video/webm';
-            const videoBlob = new Blob([data.buffer], { type: mimeType });
-            const videoURL = URL.createObjectURL(videoBlob);
-
+            const videoURL = URL.createObjectURL(finalVideoBlob);
             previewVideo.src = videoURL;
             downloadLink.href = videoURL;
             downloadLink.download = `slideshow_${targetW}x${targetH}.${ext}`;
             downloadLink.textContent = `下載高畫質影片 (${ext.toUpperCase()} - ${targetW}x${targetH})`;
 
             updateProgress(100, '影片合成完成！');
+            appendLog('全部完成！');
             resultContainer.style.display = 'block';
 
         } catch (err) {
@@ -824,6 +818,7 @@
             appendLog('\n[錯誤] ' + errMsg);
             alert('生成過程中發生錯誤：' + errMsg);
         } finally {
+            terminateFFmpeg();
             await disableBackgroundExecution();
             startBtn.disabled = false;
         }
